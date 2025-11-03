@@ -122,7 +122,7 @@ def publish_discovery_once():
 # Publish discovery once at startup
 publish_discovery_once()
 
-# ============ MQTT command handling (home page: ac_up, ac_down, unlock, lock) ============
+# ============ MQTT command handling (home page + climate page) ============
 def on_mqtt_message(client, userdata, msg):
     base = f"{MQTT_TOPIC_BASE}/cmd/"
     topic = msg.topic
@@ -131,6 +131,8 @@ def on_mqtt_message(client, userdata, msg):
         return
     sub = topic[len(base):]
     print(f"[cmd] {sub}  payload={payload!r}")
+
+    # Home page buttons
     if sub == "ac_up":
         ac_temp_up()
     elif sub == "ac_down":
@@ -139,6 +141,15 @@ def on_mqtt_message(client, userdata, msg):
         unlock_car()
     elif sub == "lock":
         lock_car()
+
+    # Climate page quick actions
+    elif sub == "climate_rapid_heat":
+        ac_rapid_heat()
+    elif sub == "climate_rapid_vent":
+        ac_rapid_cool()
+    elif sub == "climate_switch_on":
+        ac_switch_on()
+
     else:
         print(f"[cmd] Unknown command: {sub}")
 
@@ -553,12 +564,105 @@ def open_ac_page():
         if n.attrib.get("resource-id") == "com.byd.bydautolink:id/c_air_item_rl_2":
             b = _bounds_str_to_tuple(n.attrib.get("bounds") or "")
             if b:
-                x,y = _center(b)
+                x, y = _center(b)
                 adb(f"input tap {x} {y}", 0.2)
                 return True
     # Fallback: do a small tap where the setpoint sits
     adb("input tap 190 1005", 0.2)
     return True
+
+# ============ Climate page controls (Rapid heat / Rapid vent / Power) ============
+
+def _tap_by_id_on_current_dump(resource_id: str, remote="/sdcard/byd_ac.xml", local="/app/byd_ac.xml", delay=0.08) -> bool:
+    """
+    Re-dump the current screen (assumes Climate page is open), find a node by
+    resource-id, and tap its center. Returns True if a tap was sent.
+    """
+    dump_xml(remote, local, wait=0.35)
+    try:
+        root = ET.parse(local).getroot()
+    except Exception:
+        print(f"[climate] could not parse dump {local}")
+        return False
+
+    for n in root.iter("node"):
+        if n.attrib.get("resource-id", "") == resource_id:
+            m = BOUNDS_RX.search(n.attrib.get("bounds", "") or "")
+            if not m:
+                continue
+            x1, y1, x2, y2 = map(int, m.groups())
+            x, y = ((x1 + x2) // 2, (y1 + y2) // 2)
+            adb(f"input tap {x} {y}", delay)
+            return True
+
+    print(f"[climate] resource-id not found: {resource_id}")
+    return False
+
+
+def ac_rapid_heat():
+    """
+    Open Climate page → tap 'Rapid heating' → back.
+    """
+    if not open_ac_page():
+        print("[climate] cannot open A/C page")
+        return
+    ok = _tap_by_id_on_current_dump("com.byd.bydautolink:id/c_air_item_heat_btn")
+    if not ok:
+        print("[climate] Rapid heating button not found")
+    time.sleep(0.3)
+    adb("input keyevent 4", 0.4)
+
+
+def ac_rapid_cool():
+    """
+    Open Climate page → tap 'Rapid cooling' (aka ventilation) → back.
+    """
+    if not open_ac_page():
+        print("[climate] cannot open A/C page")
+        return
+    ok = _tap_by_id_on_current_dump("com.byd.bydautolink:id/c_air_item_cool_btn")
+    if not ok:
+        print("[climate] Rapid cooling button not found")
+    time.sleep(0.3)
+    adb("input keyevent 4", 0.4)
+
+
+def ac_switch_on():
+    """
+    Open Climate page → tap 'Switch on' → auto-enter PIN if prompted → publish power → back.
+    """
+    if not open_ac_page():
+        print("[climate] cannot open A/C page")
+        return
+    ok = _tap_by_id_on_current_dump("com.byd.bydautolink:id/c_air_item_power_btn")
+    if not ok:
+        print("[climate] Switch On button not found")
+        adb("input keyevent 4", 0.3)
+        return
+
+    # If BYD pops the PIN dialog, enter BYD_PIN (env) and wait for it to disappear
+    ensure_pin_if_needed()
+
+    # Optional confirmation publish (read label 'switch on/off' under the power tile)
+    try:
+        dump_xml("/sdcard/byd_ac.xml", "/app/byd_ac.xml", wait=0.5)
+        root = ET.parse("/app/byd_ac.xml").getroot()
+        power = None
+        for n in root.iter("node"):
+            if n.attrib.get("resource-id") == "com.byd.bydautolink:id/c_air_item_power_btn":
+                for m in n.iter("node"):
+                    low = (m.attrib.get("text") or "").strip().lower()
+                    if low in ("switch on", "switch off"):
+                        power = "on" if "on" in low else "off"
+                        break
+                break
+        if power:
+            client.publish(f"{MQTT_TOPIC_BASE}/climate_power", power)
+            print(f"➡️ Publish {MQTT_TOPIC_BASE}/climate_power -> {power}")
+    except Exception:
+        pass
+
+    adb("input keyevent 4", 0.4)
 
 def _as_float(s):
     try:
@@ -569,8 +673,8 @@ def _as_float(s):
 def publish_values(vals: dict):
     if not vals:
         return
-    for k,v in vals.items():
-        client.publish(f"{MQTT_TOPIC_BASE}/{k}", v if isinstance(v,str) else json.dumps(v))
+    for k, v in vals.items():
+        client.publish(f"{MQTT_TOPIC_BASE}/{k}", v if isinstance(v, str) else json.dumps(v))
         print(f"➡️ Publish {MQTT_TOPIC_BASE}/{k} -> {v}")
 
 def main_loop():

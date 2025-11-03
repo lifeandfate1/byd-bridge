@@ -47,19 +47,22 @@ LATLON_RX   = re.compile(r"(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)")
 def connect_mqtt():
     client = mqtt.Client()
     client.username_pw_set(MQTT_USER, MQTT_PASS)
-    # Last Will: set offline if we die
+    # Last Will so HA shows offline if we die unexpectedly
     client.will_set(f"{MQTT_TOPIC_BASE}/availability", "offline", retain=True)
-    client.on_disconnect = lambda c, u, rc: print("⚠️ MQTT disconnected (rc=%s)" % rc)
+    client.on_disconnect = lambda c, u, rc: print(f"⚠️ MQTT disconnected (rc={rc})")
     client.connect(MQTT_BROKER, MQTT_PORT, 60)
     client.loop_start()
-    # Mark online
+    # Mark online after connect
     client.publish(f"{MQTT_TOPIC_BASE}/availability", "online", retain=True)
     return client
 
 client = connect_mqtt()
 
 def publish_discovery_once():
-    """Minimal HA discovery for the most important sensors."""
+    """
+    Publish Home Assistant MQTT Discovery for all metrics we expose.
+    Safe to call multiple times (retained configs).
+    """
     device = {
         "identifiers": [DEVICE_ID],
         "name": DEVICE_NAME,
@@ -67,31 +70,94 @@ def publish_discovery_once():
         "model": "Autolink",
     }
 
-    def disc_sensor(name, uniq, stat_t, unit=None, dev_cla=None, value_tpl=None):
+    def disc_sensor(name, uniq, stat_t, unit=None, dev_cla=None, val_tpl=None, icon=None):
         cfg = {
-            "name": name, "uniq_id": uniq, "stat_t": stat_t,
-            "dev": device, "avty_t": f"{MQTT_TOPIC_BASE}/availability",
-            "pl_avail": "online", "pl_not_avail": "offline",
+            "name": name,
+            "uniq_id": uniq,
+            "stat_t": stat_t,
+            "dev": device,
+            "avty_t": f"{MQTT_TOPIC_BASE}/availability",
+            "pl_avail": "online",
+            "pl_not_avail": "offline",
         }
-        if unit: cfg["unit_of_meas"] = unit
-        if dev_cla: cfg["dev_cla"] = dev_cla
-        if value_tpl: cfg["val_tpl"] = value_tpl
+        if unit is not None:
+            cfg["unit_of_meas"] = unit
+        if dev_cla is not None:
+            cfg["dev_cla"] = dev_cla
+        if val_tpl is not None:
+            cfg["val_tpl"] = val_tpl
+        if icon is not None:
+            cfg["ic"] = icon
         topic = f"homeassistant/sensor/{uniq}/config"
         client.publish(topic, json.dumps(cfg), retain=True)
 
-    # A few key sensors:
-    disc_sensor("BYD Range",           "byd_range_km",          f"{MQTT_TOPIC_BASE}/range_km", unit="km")
-    disc_sensor("BYD Battery SoC",     "byd_battery_soc",       f"{MQTT_TOPIC_BASE}/battery_soc", unit="%", dev_cla="battery")
-    disc_sensor("BYD Car Status",      "byd_car_status",        f"{MQTT_TOPIC_BASE}/car_status")
-    disc_sensor("BYD Last Update",     "byd_last_update",       f"{MQTT_TOPIC_BASE}/last_update")
-    disc_sensor("BYD A/C Target Temp", "byd_ac_target_temp",    f"{MQTT_TOPIC_BASE}/climate_target_temp_c", unit="°C", dev_cla="temperature")
-    disc_sensor("BYD Odometer",        "byd_odometer",          f"{MQTT_TOPIC_BASE}/odometer", unit="km", dev_cla="distance")
-    # Tyres (PSI as string; HA will still show them)
-    for axle in ("fl","fr","rl","rr"):
-        disc_sensor(f"BYD Tyre {axle.upper()} (psi)", f"byd_tire_{axle}", f"{MQTT_TOPIC_BASE}/tire_pressure_{axle}", unit="psi")
-    # A/C power as sensor (string). Could be made a switch if we add write actions.
-    disc_sensor("BYD A/C Power", "byd_ac_power", f"{MQTT_TOPIC_BASE}/climate_power")
+    def disc_binary(name, uniq, stat_t, pl_on="ON", pl_off="OFF", dev_cla="opening", val_tpl=None, icon=None):
+        cfg = {
+            "name": name,
+            "uniq_id": uniq,
+            "stat_t": stat_t,
+            "dev": device,
+            "avty_t": f"{MQTT_TOPIC_BASE}/availability",
+            "pl_avail": "online",
+            "pl_not_avail": "offline",
+            "pl_on": pl_on,
+            "pl_off": pl_off,
+            "dev_cla": dev_cla,
+        }
+        if val_tpl is not None:
+            cfg["val_tpl"] = val_tpl
+        if icon is not None:
+            cfg["ic"] = icon
+        topic = f"homeassistant/binary_sensor/{uniq}/config"
+        client.publish(topic, json.dumps(cfg), retain=True)
 
+    # ---- Core dashboard sensors ----
+    disc_sensor("BYD Range",           "byd_range_km",           f"{MQTT_TOPIC_BASE}/range_km", unit="km")
+    disc_sensor("BYD Battery SoC",     "byd_battery_soc",        f"{MQTT_TOPIC_BASE}/battery_soc", unit="%", dev_cla="battery")
+    disc_sensor("BYD Car Status",      "byd_car_status",         f"{MQTT_TOPIC_BASE}/car_status")
+    disc_sensor("BYD Last Update",     "byd_last_update",        f"{MQTT_TOPIC_BASE}/last_update")
+    disc_sensor("BYD Odometer",        "byd_odometer",           f"{MQTT_TOPIC_BASE}/odometer", unit="km", dev_cla="distance")
+
+    # ---- A/C ----
+    disc_sensor("BYD A/C Target Temp", "byd_ac_target_temp",     f"{MQTT_TOPIC_BASE}/climate_target_temp_c", unit="°C", dev_cla="temperature")
+    disc_sensor("BYD A/C Power",       "byd_ac_power",           f"{MQTT_TOPIC_BASE}/climate_power")
+
+    # Optional neighbours shown on AC page (published if you enabled them)
+    disc_sensor("BYD A/C Prev Temp",   "byd_ac_prev_temp",       f"{MQTT_TOPIC_BASE}/climate_prev_temp_c", unit="°C", dev_cla="temperature")
+    disc_sensor("BYD A/C Next Temp",   "byd_ac_next_temp",       f"{MQTT_TOPIC_BASE}/climate_next_temp_c", unit="°C", dev_cla="temperature")
+
+    # ---- Tyres (psi) ----
+    for axle in ("fl","fr","rl","rr"):
+        disc_sensor(f"BYD Tyre {axle.upper()} (psi)",
+                    f"byd_tire_{axle}",
+                    f"{MQTT_TOPIC_BASE}/tire_pressure_{axle}",
+                    unit="psi")
+
+    # ---- Vehicle status page: binary open/closed from text ----
+    # Map payload starting with "closed" (case-insensitive) => OFF; otherwise ON.
+    closed_tpl = "{{ 'OFF' if (value|lower).startswith('closed') else 'ON' }}"
+    disc_binary("BYD Bonnet Open",     "byd_front_bonnet_open",  f"{MQTT_TOPIC_BASE}/front_bonnet", val_tpl=closed_tpl)
+    disc_binary("BYD Doors Open",      "byd_doors_open",         f"{MQTT_TOPIC_BASE}/doors",       val_tpl=closed_tpl)
+    disc_binary("BYD Windows Open",    "byd_windows_open",       f"{MQTT_TOPIC_BASE}/windows",     val_tpl=closed_tpl)
+    disc_binary("BYD Boot Open",       "byd_boot_open",          f"{MQTT_TOPIC_BASE}/boot",        val_tpl=closed_tpl)
+
+    # ---- Efficiency metrics (kWh/100km) ----
+    disc_sensor("BYD Past 50km (kWh/100km)", "byd_past50_kwh100",  f"{MQTT_TOPIC_BASE}/past_50km_kwh_per_100km", unit="kWh/100km")
+    disc_sensor("BYD Cumulative AEC",        "byd_cum_aec_kwh100", f"{MQTT_TOPIC_BASE}/cumulative_aec_kwh_per_100km", unit="kWh/100km")
+
+    # ---- Status text from vehicle status page ----
+    disc_sensor("BYD Whole Vehicle Status",  "byd_whole_status",   f"{MQTT_TOPIC_BASE}/whole_vehicle_status")
+    disc_sensor("BYD Driving Status",        "byd_driving_status", f"{MQTT_TOPIC_BASE}/driving_status")
+
+    # ---- Location: split lat/lon out of the JSON we publish at byd/app/location ----
+    disc_sensor("BYD Latitude",   "byd_latitude",
+                f"{MQTT_TOPIC_BASE}/location",
+                val_tpl="{{ value_json.latitude }}", icon="mdi:latitude")
+    disc_sensor("BYD Longitude",  "byd_longitude",
+                f"{MQTT_TOPIC_BASE}/location",
+                val_tpl="{{ value_json.longitude }}", icon="mdi:longitude")
+
+# Publish discovery once at startup
 publish_discovery_once()
 
 # ============ ADB helpers ============

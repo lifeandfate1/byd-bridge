@@ -8,6 +8,9 @@ import time
 import subprocess
 import xml.etree.ElementTree as ET
 import paho.mqtt.client as mqtt
+import threading
+import queue
+from contextlib import contextmanager
 
 # ============ Settings (env overrides supported) ============
 MQTT_BROKER      = os.getenv("MQTT_BROKER", "192.168.1.40")
@@ -19,6 +22,10 @@ MQTT_TOPIC_BASE  = os.getenv("MQTT_TOPIC_BASE", "byd/app")
 POLL_SECONDS     = int(os.getenv("POLL_SECONDS", "60"))
 DEVICE_ID        = os.getenv("BYD_DEVICE_ID", "byd-app-phone")
 DEVICE_NAME      = os.getenv("BYD_DEVICE_NAME", "BYD App Bridge")
+
+# ---- Concurrency primitives ----
+ADB_LOCK = threading.RLock()       # serialize all ADB calls
+CMD_Q = queue.Queue()              # incoming MQTT button commands
 
 # ============ UI selectors (resource-ids) ============
 
@@ -162,27 +169,23 @@ def on_mqtt_message(client, userdata, msg):
     payload = (msg.payload or b"").decode("utf-8","ignore").strip().lower()
     if not topic.startswith(base):
         return
+
     sub = topic[len(base):]
     print(f"[cmd] {sub}  payload={payload!r}")
 
-    # Home page buttons
-    if sub == "ac_up":
-        ac_temp_up()
-    elif sub == "ac_down":
-        ac_temp_down()
-    elif sub == "unlock":
-        unlock_car()
-    elif sub == "lock":
-        lock_car()
-
-    # Climate page quick actions
-    elif sub == "climate_rapid_heat":
-        ac_rapid_heat()
-    elif sub == "climate_rapid_vent":
-        ac_rapid_cool()
-    elif sub == "climate_switch_on":
-        ac_switch_on()
-
+    # Map command topics to callables (no args). Keep these lightweight.
+    COMMANDS = {
+        "ac_up":              ac_temp_up,
+        "ac_down":            ac_temp_down,
+        "unlock":             unlock_car,
+        "lock":               lock_car,
+        "climate_rapid_heat": ac_rapid_heat,      # you added these earlier
+        "climate_rapid_vent": ac_rapid_cool,      # (rapid cool == ventilation)
+        "climate_switch_on":  ac_switch_on,
+    }
+    fn = COMMANDS.get(sub)
+    if fn:
+        CMD_Q.put(fn)   # non-blocking enqueue; worker will run it ASAP
     else:
         print(f"[cmd] Unknown command: {sub}")
 
@@ -192,9 +195,11 @@ client.subscribe(f"{MQTT_TOPIC_BASE}/cmd/#")
 # ============ ADB helpers ============
 
 def adb(cmd: str, wait: float = 0.5):
-    """Run an adb shell command."""
-    subprocess.run(["adb", "shell"] + cmd.split(), check=False)
-    if wait: time.sleep(wait)
+    """Run an adb shell command under a global lock so nothing else can touch the phone concurrently."""
+    with ADB_LOCK:
+        subprocess.run(["adb", "shell"] + cmd.split(), check=False)
+    if wait:
+        time.sleep(wait)
 
 def dump_xml(remote="/sdcard/_byd_ui.xml", local="/app/_byd_ui.xml", wait=0.7):
     adb(f"uiautomator dump {remote}", wait)
@@ -710,6 +715,21 @@ def publish_values(vals: dict):
         client.publish(f"{MQTT_TOPIC_BASE}/{k}", v if isinstance(v, str) else json.dumps(v))
         print(f"➡️ Publish {MQTT_TOPIC_BASE}/{k} -> {v}")
 
+# ============ Command worker (executes queued MQTT button commands) ============
+
+def _command_worker():
+    print("[worker] Command worker started")
+    while True:
+        fn = CMD_Q.get()   # waits for a callable enqueued by on_mqtt_message
+        try:
+            # If the PIN prompt is up, enter it before running any action
+            ensure_pin_if_needed()
+            fn()  # run the action (e.g., ac_temp_up / lock_car / ac_rapid_heat)
+        except Exception as e:
+            print(f"[worker] Command error: {e}")
+        finally:
+            CMD_Q.task_done()
+
 def main_loop():
     while True:
         cycle = {}
@@ -808,6 +828,9 @@ def main_loop():
 
 if __name__ == "__main__":
     try:
+        # Start command worker so MQTT button presses are executed promptly
+        threading.Thread(target=_command_worker, daemon=True).start()
+
         main_loop()
     except KeyboardInterrupt:
         print("🚪 Exiting.")
@@ -818,3 +841,4 @@ if __name__ == "__main__":
             client.disconnect()
         except Exception:
             pass
+

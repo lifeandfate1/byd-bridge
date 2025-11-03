@@ -15,7 +15,7 @@ COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
 # App files
-COPY byd_mqtt_bridge.py /app/
+COPY byd_bridge.py /app/
 COPY entrypoint.sh /app/
 RUN chmod +x /app/entrypoint.sh
 

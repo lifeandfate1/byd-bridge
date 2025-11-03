@@ -1,20 +1,12 @@
 FROM python:3.12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    PATH="/opt/platform-tools:${PATH}"
+    PYTHONUNBUFFERED=1
 
-# Install minimal tools (curl, unzip) and certificates
+# Install adb from Debian repos (simplest) + certs
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl unzip \
+      adb ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
-# Fetch official Android platform-tools (adb) from Google
-ARG PLATFORM_TOOLS_URL=https://dl.google.com/android/repository/platform-tools-latest-linux.zip
-RUN curl -fsSL "$PLATFORM_TOOLS_URL" -o /tmp/platform-tools.zip \
-    && unzip -q /tmp/platform-tools.zip -d /opt \
-    && rm -f /tmp/platform-tools.zip \
-    && /opt/platform-tools/adb version
 
 WORKDIR /app
 

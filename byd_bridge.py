@@ -60,7 +60,7 @@ client = connect_mqtt()
 
 def publish_discovery_once():
     """
-    Publish Home Assistant MQTT Discovery for all metrics we expose.
+    Publish Home Assistant MQTT Discovery for all metrics AND action buttons.
     Safe to call multiple times (retained configs).
     """
     device = {
@@ -70,17 +70,19 @@ def publish_discovery_once():
         "model": "Autolink",
     }
 
+    # ------- Sensors (read-only state we publish on {MQTT_TOPIC_BASE}/...) -------
     def disc_sensor(name, uniq, stat_t, unit=None, dev_cla=None, val_tpl=None, icon=None):
         cfg = {
             "name": name,
             "uniq_id": uniq,
-            "stat_t": stat_t,
+            "stat_t": stat_t,                                 # state_topic
             "dev": device,
-            "avty_t": f"{MQTT_TOPIC_BASE}/availability",
+            "avty_t": f"{MQTT_TOPIC_BASE}/availability",      # availability_topic
             "pl_avail": "online",
             "pl_not_avail": "offline",
-            "dev_cla": dev_cla,
         }
+        if dev_cla is not None:
+            cfg["dev_cla"] = dev_cla
         if val_tpl is not None:
             cfg["val_tpl"] = val_tpl
         if icon is not None:
@@ -91,13 +93,31 @@ def publish_discovery_once():
         topic = f"homeassistant/sensor/{uniq}/config"
         client.publish(topic, json.dumps(cfg), retain=True)
 
-    # Core things
+    # ------- Stateless buttons (publish to {MQTT_TOPIC_BASE}/cmd/... on press) -------
+    def disc_button(name, uniq, cmd_t, payload="press", icon=None):
+        cfg = {
+            "name": name,
+            "uniq_id": uniq,
+            "cmd_t": cmd_t,                                   # command_topic
+            "pl_prs": payload,                                # payload on press
+            "dev": device,
+            "avty_t": f"{MQTT_TOPIC_BASE}/availability",
+            "pl_avail": "online",
+            "pl_not_avail": "offline",
+        }
+        if icon is not None:
+            cfg["ic"] = icon
+
+        topic = f"homeassistant/button/{uniq}/config"
+        client.publish(topic, json.dumps(cfg), retain=True)
+
+    # -------- Core sensors --------
     disc_sensor("BYD Range",           "byd_range_km",          f"{MQTT_TOPIC_BASE}/range_km", unit="km", dev_cla="distance")
     disc_sensor("BYD Battery SoC",     "byd_battery_soc",       f"{MQTT_TOPIC_BASE}/battery_soc", unit="%", dev_cla="battery")
     disc_sensor("BYD Car Status",      "byd_car_status",        f"{MQTT_TOPIC_BASE}/car_status")
     disc_sensor("BYD Last Update",     "byd_last_update",       f"{MQTT_TOPIC_BASE}/last_update")
 
-    # Climate (from home card & A/C page)
+    # Climate (home card & A/C page)
     disc_sensor("BYD A/C Target Temp", "byd_ac_target_temp",    f"{MQTT_TOPIC_BASE}/climate_target_temp_c", unit="°C", dev_cla="temperature")
     disc_sensor("BYD A/C PAST Temp",   "byd_ac_prev_temp",      f"{MQTT_TOPIC_BASE}/climate_prev_temp_c", unit="°C", dev_cla="temperature")
     disc_sensor("BYD A/C NEXT Temp",   "byd_ac_next_temp",      f"{MQTT_TOPIC_BASE}/climate_next_temp_c", unit="°C", dev_cla="temperature")
@@ -107,7 +127,7 @@ def publish_discovery_once():
     for axle in ("fl","fr","rl","rr"):
         disc_sensor(f"BYD Tyre {axle.upper()} (psi)", f"byd_tire_{axle}", f"{MQTT_TOPIC_BASE}/tire_pressure_{axle}", unit="psi")
 
-    # Doors/Windows/Bonnet/Boot
+    # Doors/Windows/Bonnet/Boot & statuses
     disc_sensor("BYD Doors",           "byd_doors",             f"{MQTT_TOPIC_BASE}/doors")
     disc_sensor("BYD Windows",         "byd_windows",           f"{MQTT_TOPIC_BASE}/windows")
     disc_sensor("BYD Bonnet",          "byd_front_bonnet",      f"{MQTT_TOPIC_BASE}/front_bonnet")
@@ -116,8 +136,21 @@ def publish_discovery_once():
     disc_sensor("BYD Driving Status",  "byd_driving_status",    f"{MQTT_TOPIC_BASE}/driving_status")
     disc_sensor("BYD Odometer",        "byd_odometer",          f"{MQTT_TOPIC_BASE}/odometer", unit="km", dev_cla="distance")
 
-    # Vehicle position (lat/lon) – show raw JSON, let HA template sensors derive pretty fields if needed
+    # GPS (raw JSON payload; template in HA if you want lat/lon entities)
     disc_sensor("BYD GPS JSON",        "byd_gps_json",          f"{MQTT_TOPIC_BASE}/location", val_tpl="{{ value | default('') }}", icon="mdi:map-marker")
+
+    # -------- Action buttons (stateless) --------
+    # Home page actions
+    disc_button("BYD A/C Temp ▲",     "byd_cmd_ac_up",           f"{MQTT_TOPIC_BASE}/cmd/ac_up",          icon="mdi:thermometer-plus")
+    disc_button("BYD A/C Temp ▼",     "byd_cmd_ac_down",         f"{MQTT_TOPIC_BASE}/cmd/ac_down",        icon="mdi:thermometer-minus")
+    disc_button("BYD Unlock",          "byd_cmd_unlock",          f"{MQTT_TOPIC_BASE}/cmd/unlock",         icon="mdi:lock-open-variant")
+    disc_button("BYD Lock",            "byd_cmd_lock",            f"{MQTT_TOPIC_BASE}/cmd/lock",           icon="mdi:lock")
+
+    # Climate page quick actions
+    disc_button("BYD Rapid Heat",      "byd_cmd_climate_heat",    f"{MQTT_TOPIC_BASE}/cmd/climate_rapid_heat", icon="mdi:fire")
+    disc_button("BYD Rapid Vent",      "byd_cmd_climate_vent",    f"{MQTT_TOPIC_BASE}/cmd/climate_rapid_vent", icon="mdi:fan")
+    disc_button("BYD A/C Switch On",   "byd_cmd_climate_on",      f"{MQTT_TOPIC_BASE}/cmd/climate_switch_on",  icon="mdi:power")
+
 
 # Publish discovery once at startup
 publish_discovery_once()

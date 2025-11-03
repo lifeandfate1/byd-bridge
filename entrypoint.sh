@@ -43,4 +43,4 @@ if ! adb devices | grep -q "${PHONE_IP}:${ADB_PORT}.*device"; then
 fi
 
 echo "[entrypoint] Launching Python script..."
-exec python /app/byd_mqtt_bridge.py
+exec python /app/byd_bridge.py

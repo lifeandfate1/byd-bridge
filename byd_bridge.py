@@ -226,8 +226,6 @@ def row_value(items, label_txt, y_tol=40, x_pad=20):
 def dump_vehicle_status_two_pages():
     """Open Vehicle status, dump top and bottom, leaving the page open."""
     # Try to ensure home/top, then scroll a little to reveal cards
-    adb("input keyevent 111", 0.15)  # ESC
-    adb("input keyevent 4",   0.15)  # BACK (if inside subpage)
     adb("input swipe 333 316 333 948 250", 0.2)  # small down
     adb("input swipe 333 948 333 316 350", 0.5)  # scroll up to show cards
 

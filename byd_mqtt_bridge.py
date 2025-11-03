@@ -92,15 +92,18 @@ def adb_shell(cmd: str, wait: float = 1.0):
 
 # Tap/Swipe actions (coordinates may need tuning for your device)
 ACTIONS = {
-    "refresh": ("input tap 546 370", 2),
-    "car_status": ("input tap 284 1131", 1),
-    "car_position": ("input tap 854 1822", 1),
-    "navigation": ("input tap 726 1983", 1),
-    "map_back": ("input tap 92 242", 1),
-    "finish": ("input tap 84 170", 1),
-    "swipe_up": ("input swipe 500 1500 500 500 500", 2),
-    "swipe_down": ("input swipe 500 500 500 1500 500", 2),
+    "refresh": ("input tap 364 234", 2),           # header refresh area
+    "car_status": ("input tap 189 715", 1),        # vehicle status card
+    "car_position": ("input tap 569 1167", 1),     # "Vehicle position" card center
+    "navigation": ("input tap 484 1254", 1),       # nav/map entry (if needed)
+    "map_back": ("input tap 61 153", 1),           # top-left back
+    "finish": ("input tap 56 107", 1),
+    "swipe_up": ("input swipe 333 948 333 316 500", 2),
+    "swipe_down": ("input swipe 333 316 333 948 500", 2),
     "stop_google_maps": ("am force-stop com.google.android.apps.maps", 2),
+    # generic dismissors for popups:
+    "back_once": ("input keyevent 4", 0.3),        # Android BACK
+    "escape": ("input keyevent 111", 0.2),         # ESC
 }
 
 def perform(action: str):

@@ -23,6 +23,20 @@ POLL_SECONDS     = int(os.getenv("POLL_SECONDS", "60"))
 DEVICE_ID        = os.getenv("BYD_DEVICE_ID", "byd-app-phone")
 DEVICE_NAME      = os.getenv("BYD_DEVICE_NAME", "BYD App Bridge")
 
+# --- Page selection flags (0/1). HOME is forced to 1 ---
+# Set these to 0 in your docker-compose or env to skip pages
+POLL_VEHICLE_STATUS    = int(os.getenv("POLL_VEHICLE_STATUS", "1"))
+POLL_AC                = int(os.getenv("POLL_AC", "1"))
+POLL_VEHICLE_POSITION  = int(os.getenv("POLL_VEHICLE_POSITION", "1"))
+
+# Normalized map for easy lookup
+PAGES_ENABLED = {
+    "home": True,
+    "vehicle_status": bool(POLL_VEHICLE_STATUS),
+    "ac": bool(POLL_AC),
+    "vehicle_position": bool(POLL_VEHICLE_POSITION),
+}
+
 # ---- Concurrency primitives ----
 ADB_LOCK = threading.RLock()       # serialize all ADB calls
 CMD_Q = queue.Queue()              # incoming MQTT button commands
@@ -30,7 +44,6 @@ CMD_Q = queue.Queue()              # incoming MQTT button commands
 # ============ UI selectors (resource-ids) ============
 
 # Home screen mappings (as seen in your dumps)
-# Add or adjust here if BYD updates the app
 XML_MAP = {
     "com.byd.bydautolink:id/h_km_tv":              "range_km",
     "com.byd.bydautolink:id/tv_batter_percentage": "battery_soc",
@@ -49,14 +62,15 @@ KM_RX       = re.compile(r"^\s*([\d,]+)\s*km\s*$", re.IGNORECASE)
 KWH100_RX   = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*kW\s*·?\s*h/100km\s*$", re.IGNORECASE)
 LATLON_RX   = re.compile(r"(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)")
 
-# ============ MQTT Discovery Logic ============
+# ============ MQTT Discovery Logic (Smart) ============
 
 def publish_discovery(client):
     """
-    Publish Home Assistant MQTT Discovery for all metrics AND action buttons.
-    Safe to call multiple times (retained configs).
+    Publish Home Assistant MQTT Discovery.
+    - Creates configs for enabled pages.
+    - PURGES configs (sends empty payload) for disabled pages.
     """
-    print("[MQTT] Sending Home Assistant Discovery payloads...")
+    print("[MQTT] Sending Smart Home Assistant Discovery payloads...")
     
     device = {
         "identifiers": [DEVICE_ID],
@@ -65,88 +79,99 @@ def publish_discovery(client):
         "model": "Autolink",
     }
 
-    # ------- Sensors (read-only state we publish on {MQTT_TOPIC_BASE}/...) -------
-    def disc_sensor(name, uniq, stat_t, unit=None, dev_cla=None, val_tpl=None, icon=None):
+    # Helpers
+    def _sensor_cfg(name, uniq, stat_t, unit=None, dev_cla=None, val_tpl=None, icon=None):
         cfg = {
             "name": name,
             "uniq_id": uniq,
-            "stat_t": stat_t,                                 # state_topic
-            "dev": device,
-            "avty_t": f"{MQTT_TOPIC_BASE}/availability",      # availability_topic
-            "pl_avail": "online",
-            "pl_not_avail": "offline",
-        }
-        if dev_cla is not None:
-            cfg["dev_cla"] = dev_cla
-        if val_tpl is not None:
-            cfg["val_tpl"] = val_tpl
-        if icon is not None:
-            cfg["ic"] = icon
-        if unit is not None:
-            cfg["unit_of_meas"] = unit
-
-        topic = f"homeassistant/sensor/{uniq}/config"
-        client.publish(topic, json.dumps(cfg), retain=True)
-
-    # ------- Stateless buttons (publish to {MQTT_TOPIC_BASE}/cmd/... on press) -------
-    def disc_button(name, uniq, cmd_t, payload="press", icon=None):
-        cfg = {
-            "name": name,
-            "uniq_id": uniq,
-            "cmd_t": cmd_t,                                   # command_topic
-            "pl_prs": payload,                                # payload on press
+            "stat_t": stat_t,
             "dev": device,
             "avty_t": f"{MQTT_TOPIC_BASE}/availability",
             "pl_avail": "online",
             "pl_not_avail": "offline",
         }
-        if icon is not None:
-            cfg["ic"] = icon
+        if dev_cla: cfg["dev_cla"] = dev_cla
+        if val_tpl: cfg["val_tpl"] = val_tpl
+        if icon:    cfg["ic"] = icon
+        if unit:    cfg["unit_of_meas"] = unit
+        return cfg
 
+    def _publish_config(uniq, cfg):
+        topic = f"homeassistant/sensor/{uniq}/config"
+        client.publish(topic, json.dumps(cfg), retain=True)
+
+    def _purge_config(uniq):
+        topic = f"homeassistant/sensor/{uniq}/config"
+        client.publish(topic, "", retain=True) # Empty payload removes entity
+
+    # Registry of sensors mapped to their "page"
+    registry = [
+        # HOME (always enabled)
+        ("home", "BYD Range",           "byd_range_km",         f"{MQTT_TOPIC_BASE}/range_km",             "km", "distance", None, None),
+        ("home", "BYD Battery SoC",     "byd_battery_soc",      f"{MQTT_TOPIC_BASE}/battery_soc",          "%",  "battery",  None, None),
+        ("home", "BYD Car Status",      "byd_car_status",       f"{MQTT_TOPIC_BASE}/car_status",           None, None,       None, None),
+        ("home", "BYD Last Update",     "byd_last_update",      f"{MQTT_TOPIC_BASE}/last_update",          None, None,       None, None),
+        ("home", "BYD A/C Target Temp", "byd_ac_target_temp",   f"{MQTT_TOPIC_BASE}/climate_target_temp_c","°C", "temperature", None, None),
+
+        # A/C PAGE (Optional)
+        ("ac",   "BYD A/C PAST Temp",   "byd_ac_prev_temp",     f"{MQTT_TOPIC_BASE}/climate_prev_temp_c",  "°C", "temperature", None, None),
+        ("ac",   "BYD A/C NEXT Temp",   "byd_ac_next_temp",     f"{MQTT_TOPIC_BASE}/climate_next_temp_c",  "°C", "temperature", None, None),
+        ("ac",   "BYD A/C Power",       "byd_ac_power",         f"{MQTT_TOPIC_BASE}/climate_power",        None, None,       None, None),
+
+        # VEHICLE STATUS (Optional)
+        ("vehicle_status", "BYD Tyre FL (psi)", "byd_tire_pressure_fl", f"{MQTT_TOPIC_BASE}/tire_pressure_fl", "psi", None, None, None),
+        ("vehicle_status", "BYD Tyre FR (psi)", "byd_tire_pressure_fr", f"{MQTT_TOPIC_BASE}/tire_pressure_fr", "psi", None, None, None),
+        ("vehicle_status", "BYD Tyre RL (psi)", "byd_tire_pressure_rl", f"{MQTT_TOPIC_BASE}/tire_pressure_rl", "psi", None, None, None),
+        ("vehicle_status", "BYD Tyre RR (psi)", "byd_tire_pressure_rr", f"{MQTT_TOPIC_BASE}/tire_pressure_rr", "psi", None, None, None),
+        ("vehicle_status", "BYD Doors",         "byd_doors",             f"{MQTT_TOPIC_BASE}/doors",            None, None, None, None),
+        ("vehicle_status", "BYD Windows",       "byd_windows",           f"{MQTT_TOPIC_BASE}/windows",          None, None, None, None),
+        ("vehicle_status", "BYD Bonnet",        "byd_front_bonnet",      f"{MQTT_TOPIC_BASE}/front_bonnet",     None, None, None, None),
+        ("vehicle_status", "BYD Boot",          "byd_boot",              f"{MQTT_TOPIC_BASE}/boot",             None, None, None, None),
+        ("vehicle_status", "BYD Whole Vehicle", "byd_whole_vehicle",     f"{MQTT_TOPIC_BASE}/whole_vehicle_status", None, None, None, None),
+        ("vehicle_status", "BYD Driving Status","byd_driving_status",    f"{MQTT_TOPIC_BASE}/driving_status",   None, None, None, None),
+        ("vehicle_status", "BYD Odometer",      "byd_odometer",          f"{MQTT_TOPIC_BASE}/odometer",         "km", "distance", None, None),
+
+        # VEHICLE POSITION (Optional)
+        ("vehicle_position","BYD GPS JSON",     "byd_gps_json",          f"{MQTT_TOPIC_BASE}/location",         None, None, "{{ value | default('') }}", "mdi:map-marker"),
+    ]
+
+    # Process Registry
+    for page, name, uniq, stat_t, unit, dev_cla, val_tpl, icon in registry:
+        # Check if this page is enabled in settings
+        if PAGES_ENABLED.get(page, False):
+            # Publish Config
+            cfg = _sensor_cfg(name, uniq, stat_t, unit, dev_cla, val_tpl, icon)
+            _publish_config(uniq, cfg)
+        else:
+            # Purge Config (cleanup)
+            _purge_config(uniq)
+
+    # ------- Buttons (Always Publish) -------
+    # These are stateless and don't hurt to have even if polling is off
+    def disc_button(name, uniq, cmd_t, payload="press", icon=None):
+        cfg = {
+            "name": name,
+            "uniq_id": uniq,
+            "cmd_t": cmd_t,                                   
+            "pl_prs": payload,                                
+            "dev": device,
+            "avty_t": f"{MQTT_TOPIC_BASE}/availability",
+            "pl_avail": "online",
+            "pl_not_avail": "offline",
+        }
+        if icon: cfg["ic"] = icon
         topic = f"homeassistant/button/{uniq}/config"
         client.publish(topic, json.dumps(cfg), retain=True)
 
-    # -------- Core sensors --------
-    disc_sensor("BYD Range",           "byd_range_km",          f"{MQTT_TOPIC_BASE}/range_km", unit="km", dev_cla="distance")
-    disc_sensor("BYD Battery SoC",     "byd_battery_soc",       f"{MQTT_TOPIC_BASE}/battery_soc", unit="%", dev_cla="battery")
-    disc_sensor("BYD Car Status",      "byd_car_status",        f"{MQTT_TOPIC_BASE}/car_status")
-    disc_sensor("BYD Last Update",     "byd_last_update",       f"{MQTT_TOPIC_BASE}/last_update")
-
-    # Climate (home card & A/C page)
-    disc_sensor("BYD A/C Target Temp", "byd_ac_target_temp",    f"{MQTT_TOPIC_BASE}/climate_target_temp_c", unit="°C", dev_cla="temperature")
-    disc_sensor("BYD A/C PAST Temp",   "byd_ac_prev_temp",      f"{MQTT_TOPIC_BASE}/climate_prev_temp_c", unit="°C", dev_cla="temperature")
-    disc_sensor("BYD A/C NEXT Temp",   "byd_ac_next_temp",      f"{MQTT_TOPIC_BASE}/climate_next_temp_c", unit="°C", dev_cla="temperature")
-    disc_sensor("BYD A/C Power",       "byd_ac_power",          f"{MQTT_TOPIC_BASE}/climate_power")
-
-    # Tyres (psi)
-    for axle in ("fl","fr","rl","rr"):
-        disc_sensor(f"BYD Tyre {axle.upper()} (psi)", f"byd_tire_{axle}", f"{MQTT_TOPIC_BASE}/tire_pressure_{axle}", unit="psi")
-
-    # Doors/Windows/Bonnet/Boot & statuses
-    disc_sensor("BYD Doors",           "byd_doors",             f"{MQTT_TOPIC_BASE}/doors")
-    disc_sensor("BYD Windows",         "byd_windows",           f"{MQTT_TOPIC_BASE}/windows")
-    disc_sensor("BYD Bonnet",          "byd_front_bonnet",      f"{MQTT_TOPIC_BASE}/front_bonnet")
-    disc_sensor("BYD Boot",            "byd_boot",              f"{MQTT_TOPIC_BASE}/boot")
-    disc_sensor("BYD Whole Vehicle",   "byd_whole_vehicle",     f"{MQTT_TOPIC_BASE}/whole_vehicle_status")
-    disc_sensor("BYD Driving Status",  "byd_driving_status",    f"{MQTT_TOPIC_BASE}/driving_status")
-    disc_sensor("BYD Odometer",        "byd_odometer",          f"{MQTT_TOPIC_BASE}/odometer", unit="km", dev_cla="distance")
-
-    # GPS (raw JSON payload; template in HA if you want lat/lon entities)
-    disc_sensor("BYD GPS JSON",        "byd_gps_json",          f"{MQTT_TOPIC_BASE}/location", val_tpl="{{ value | default('') }}", icon="mdi:map-marker")
-
-    # -------- Action buttons (stateless) --------
-    # Home page actions
     disc_button("BYD A/C Temp ▲",     "byd_cmd_ac_up",           f"{MQTT_TOPIC_BASE}/cmd/ac_up",          icon="mdi:thermometer-plus")
     disc_button("BYD A/C Temp ▼",     "byd_cmd_ac_down",         f"{MQTT_TOPIC_BASE}/cmd/ac_down",        icon="mdi:thermometer-minus")
     disc_button("BYD Unlock",          "byd_cmd_unlock",          f"{MQTT_TOPIC_BASE}/cmd/unlock",         icon="mdi:lock-open-variant")
     disc_button("BYD Lock",            "byd_cmd_lock",            f"{MQTT_TOPIC_BASE}/cmd/lock",           icon="mdi:lock")
-
-    # Climate page quick actions
     disc_button("BYD Rapid Heat",      "byd_cmd_climate_heat",    f"{MQTT_TOPIC_BASE}/cmd/climate_rapid_heat", icon="mdi:fire")
     disc_button("BYD Rapid Vent",      "byd_cmd_climate_vent",    f"{MQTT_TOPIC_BASE}/cmd/climate_rapid_vent", icon="mdi:fan")
     disc_button("BYD A/C Switch On",   "byd_cmd_climate_on",      f"{MQTT_TOPIC_BASE}/cmd/climate_switch_on",  icon="mdi:power")
     
-    print("[MQTT] Discovery payloads sent.")
+    print("[MQTT] Discovery refresh complete.")
 
 # ============ MQTT Connection Setup ============
 
@@ -154,7 +179,7 @@ def on_connect(client, userdata, flags, rc):
     print(f"[MQTT] Connected with result code {rc}")
     # Mark online
     client.publish(f"{MQTT_TOPIC_BASE}/availability", "online", retain=True)
-    # Send Discovery EVERY time we connect, to ensure HA sees it
+    # Send Discovery EVERY time we connect (Robustness fix)
     publish_discovery(client)
 
 def connect_mqtt():
@@ -162,7 +187,7 @@ def connect_mqtt():
     if MQTT_USER and MQTT_PASS:
         client.username_pw_set(MQTT_USER, MQTT_PASS)
     
-    # Last Will so HA shows offline if we die unexpectedly
+    # Last Will
     client.will_set(f"{MQTT_TOPIC_BASE}/availability", "offline", retain=True)
     
     client.on_connect = on_connect
@@ -176,7 +201,7 @@ def connect_mqtt():
 # Initialize Client
 client = connect_mqtt()
 
-# ============ MQTT command handling (home page + climate page) ============
+# ============ MQTT command handling ============
 def on_mqtt_message(client, userdata, msg):
     base = f"{MQTT_TOPIC_BASE}/cmd/"
     topic = msg.topic
@@ -187,19 +212,18 @@ def on_mqtt_message(client, userdata, msg):
     sub = topic[len(base):]
     print(f"[cmd] {sub}  payload={payload!r}")
 
-    # Map command topics to callables (no args). Keep these lightweight.
     COMMANDS = {
         "ac_up":              ac_temp_up,
         "ac_down":            ac_temp_down,
         "unlock":             unlock_car,
         "lock":               lock_car,
-        "climate_rapid_heat": ac_rapid_heat,      # you added these earlier
-        "climate_rapid_vent": ac_rapid_cool,      # (rapid cool == ventilation)
+        "climate_rapid_heat": ac_rapid_heat,
+        "climate_rapid_vent": ac_rapid_cool,
         "climate_switch_on":  ac_switch_on,
     }
     fn = COMMANDS.get(sub)
     if fn:
-        CMD_Q.put(fn)   # non-blocking enqueue; worker will run it ASAP
+        CMD_Q.put(fn)
     else:
         print(f"[cmd] Unknown command: {sub}")
 
@@ -209,7 +233,6 @@ client.subscribe(f"{MQTT_TOPIC_BASE}/cmd/#")
 # ============ ADB helpers ============
 
 def adb(cmd: str, wait: float = 0.5):
-    """Run an adb shell command under a global lock so nothing else can touch the phone concurrently."""
     with ADB_LOCK:
         subprocess.run(["adb", "shell"] + cmd.split(), check=False)
     if wait:
@@ -233,7 +256,6 @@ def _text(n):
     return (n.attrib.get("text") or "").strip()
 
 def extract_values_from_xml(local_xml_path):
-    """Parse a single dumped XML (home card) for simple values."""
     vals = {}
     try:
         root = ET.parse(local_xml_path).getroot()
@@ -251,9 +273,8 @@ def extract_values_from_xml(local_xml_path):
                 m = KM_RX.match(txt)
                 vals[key] = m.group(1).replace(",", "") if m else txt
             elif key == "battery_soc":
-                vals[key] = txt  # numeric string already
+                vals[key] = txt
             elif key == "climate_target_temp_c":
-                # number like "26"
                 try:
                     vals[key] = float(txt)
                 except ValueError:
@@ -275,12 +296,6 @@ def gather_items(local_xml_path):
     return items
 
 def tap_by_label(label: str, local="/app/_byd_home.xml", remote="/sdcard/_byd_home.xml"):
-    """
-    Find a visible label (TextView text) and tap its tappable container:
-    1) nearest ancestor with resource-id containing 'content_group'
-    2) else nearest clickable ancestor
-    3) else the label's own bounds
-    """
     dump_xml(remote, local, wait=0.5)
     try:
         root = ET.parse(local).getroot()
@@ -307,7 +322,6 @@ def tap_by_label(label: str, local="/app/_byd_home.xml", remote="/sdcard/_byd_ho
         print(f"tap_by_label: '{label}' not found")
         return False
 
-    # Prefer ancestor with resource-id containing "content_group", else first clickable ancestor, else the label itself
     b = None
     for n in reversed(target[:-1]):
         if "content_group" in (n.attrib.get("resource-id") or ""):
@@ -340,10 +354,7 @@ def find_by_id_center(root, rid: str):
 
 # ============ PIN detection & entry ============
 
-# BYD_PIN is taken from environment only (no baked default).
 PIN_CODE = os.getenv("BYD_PIN", "").strip()
-
-# Your calibrated keypad coordinates (device-specific)
 PIN_TAPS = {
     "1": (170,  680), "2": (360,  680), "3": (550,  680),
     "4": (170,  870), "5": (360,  870), "6": (550,  870),
@@ -361,7 +372,6 @@ def _ui_dump(local="/app/byd_ui.xml", remote="/sdcard/byd_ui.xml"):
         return None
 
 def pin_prompt_present() -> bool:
-    """Detect BYD PIN dialog via title node text (works even if EditText is hidden)."""
     root = _ui_dump(local="/app/byd_pin_check.xml", remote="/sdcard/byd_pin_check.xml")
     if root is None: 
         return False
@@ -376,7 +386,6 @@ def _tap_xy(x:int, y:int, delay:float=0.12):
     adb(f"input tap {x} {y}", delay)
 
 def enter_pin_via_coords(pin: str | None = None):
-    """Tap the numeric keypad using fixed coordinates. Requires BYD_PIN set."""
     s = (pin or PIN_CODE).strip()
     if not s:
         print("⚠️ BYD_PIN not set; cannot enter PIN")
@@ -389,10 +398,8 @@ def enter_pin_via_coords(pin: str | None = None):
         _tap_xy(xy[0], xy[1])
 
 def ensure_pin_if_needed(timeout_s: float = 6.0) -> bool:
-    """If PIN prompt is up, enter BYD_PIN and wait for it to disappear."""
     if not pin_prompt_present():
         return True
-    # small nudge near keypad area (harmless)
     _tap_xy(360, 1245, 0.08)
     enter_pin_via_coords(PIN_CODE)
     t0 = time.time()
@@ -402,7 +409,7 @@ def ensure_pin_if_needed(timeout_s: float = 6.0) -> bool:
         time.sleep(0.2)
     return True
 
-# ============ Home-page controls (A/C temp up/down, Lock/Unlock) ============
+# ============ Home-page controls ============
 
 def _bounds_to_center(bounds: str):
     m = BOUNDS_RX.search(bounds or "")
@@ -443,7 +450,6 @@ def ac_temp_down():
     print("AC ▼ not found on home; ensure 'My car' is visible.")
 
 def _quick_control_tiles():
-    """Return quick-control tiles sorted left→right as list of (x,y)."""
     root_path = _dump_home()
     try:
         root = ET.parse(root_path).getroot()
@@ -462,7 +468,7 @@ def unlock_car():
     tiles = _quick_control_tiles()
     if not tiles:
         print("Unlock: no quick-control tiles found."); return
-    x,y = tiles[0]   # first tile = Unlock on your layout
+    x,y = tiles[0]
     adb(f"input tap {x} {y}", 0.08)
     ensure_pin_if_needed()
 
@@ -470,34 +476,13 @@ def lock_car():
     tiles = _quick_control_tiles()
     if len(tiles) < 2:
         print("Lock: not enough quick-control tiles found."); return
-    x,y = tiles[1]   # second tile = Lock on your layout
+    x,y = tiles[1]
     adb(f"input tap {x} {y}", 0.08)
     ensure_pin_if_needed()
 
 # ============ Vehicle status (two pages) ============
 
-def _center(b):
-    x1,y1, x2,y2 = b
-    return ((x1+x2)//2, (y1+y2)//2)
-
-def _find_text_positions(local_xml):
-    """Return list of (text, bounds) from a dumped xml, preserving duplicates."""
-    pairs = []
-    try:
-        root = ET.parse(local_xml).getroot()
-    except Exception:
-        return pairs
-    for n in root.iter("node"):
-        t = (n.attrib.get("text") or "").strip()
-        if t:
-            pairs.append((t, n.attrib.get("bounds") or ""))
-    return pairs
-
 def nearest_value_above(items, label_text, value_regex=None):
-    """
-    Based on your dumps, labels like 'Front-left' appear above their values.
-    We find the first match and choose the nearest numeric text below it.
-    """
     cand = []
     label_bounds = None
     for t,b in items:
@@ -515,7 +500,7 @@ def nearest_value_above(items, label_text, value_regex=None):
         if not m: 
             continue
         x1,y1,x2,y2 = map(int, m.groups())
-        if y1 >= ly2:  # below the label
+        if y1 >= ly2:
             if value_regex:
                 if not value_regex.match(t):
                     continue
@@ -526,16 +511,14 @@ def nearest_value_above(items, label_text, value_regex=None):
     return None
 
 def dump_vehicle_status_two_pages():
-    """Open Vehicle status, dump top and bottom, leaving the page open."""
-    # Try to ensure home/top, then scroll a little to reveal cards
-    adb("input swipe 333 316 333 948 250", 0.2)  # small down
-    adb("input swipe 333 948 333 316 350", 0.5)  # scroll up to show cards
+    adb("input swipe 333 316 333 948 250", 0.2)
+    adb("input swipe 333 948 333 316 350", 0.5)
 
     if not tap_by_label("Vehicle status"):
         return None, None
 
     top_xml    = dump_xml("/sdcard/byd_status_top.xml",    "/app/byd_status_top.xml")
-    adb("input swipe 333 948 333 316 450", 0.6)  # scroll within status page
+    adb("input swipe 333 948 333 316 450", 0.6)
     bottom_xml = dump_xml("/sdcard/byd_status_bottom.xml", "/app/byd_status_bottom.xml")
     return top_xml, bottom_xml
 
@@ -545,33 +528,25 @@ def parse_vehicle_status_two_pages(top_xml, bottom_xml):
     items.extend(gather_items(top_xml))
     items.extend(gather_items(bottom_xml))
 
-    # Tyres by on-screen position (two rows, left→right)
     tyres = []
     for t,b in items:
         m = PSI_RX.match(t)
         if m:
             v = m.group(1)
             tyres.append( (b, v) )
-    # Sort two rows (by Y, then X)
     tyre_pos = []
     for b,v in tyres:
         m = BOUNDS_RX.search(b or "")
-        if not m: 
-            continue
+        if not m: continue
         x1,y1,x2,y2 = map(int, m.groups())
         tyre_pos.append((y1, x1, v))
     tyre_pos.sort()
-    # Expect 4 tyre values
     if len(tyre_pos) >= 4:
-        # first row (front): left→right
         vals["tire_pressure_fl"] = tyre_pos[0][2]
         vals["tire_pressure_fr"] = tyre_pos[1][2]
-        # second row (rear): left→right
         vals["tire_pressure_rl"] = tyre_pos[2][2]
         vals["tire_pressure_rr"] = tyre_pos[3][2]
 
-    # Doors/Windows/Bonnet/Boot, Whole Vehicle Status, Driving Status, Odometer
-    # We match by label text and read the nearest numeric/value below each label.
     label_map = {
         "Front hood":        "front_bonnet",
         "Door":              "doors",
@@ -584,7 +559,6 @@ def parse_vehicle_status_two_pages(top_xml, bottom_xml):
         "Total energy":      "total_energy_value",
     }
 
-    # Recent/Total energy formats vary. Try generic capture too.
     for label, key in label_map.items():
         regex = None
         if key in ("recent_energy_value", "total_energy_value"):
@@ -596,22 +570,16 @@ def parse_vehicle_status_two_pages(top_xml, bottom_xml):
                 vals[key] = mv.group(1).replace(",", "") if mv else v
             else:
                 vals[key] = v
-
     return vals
 
-# ============ A/C page parsing (for prev/next setpoints & power) ============
+# ============ A/C page parsing ============
 
 def open_ac_page():
-    # On your home page the climate card has visible label text "Seats" and "Vehicle position" below it.
-    # The climate card is the left tile of the widgets row. We can just tap the center of that tile by id.
-    # But to avoid brittle id, use the explicit known id on your dump:
-    # com.byd.bydautolink:id/c_air_item_rl_2  (container for the setpoint row)
     local = dump_xml("/sdcard/byd_home.xml", "/app/byd_home.xml")
     try:
         root = ET.parse(local).getroot()
     except Exception:
         return False
-    # Find the setpoint container and tap its center to open full A/C page
     for n in root.iter("node"):
         if n.attrib.get("resource-id") == "com.byd.bydautolink:id/c_air_item_rl_2":
             b = _bounds_str_to_tuple(n.attrib.get("bounds") or "")
@@ -619,17 +587,12 @@ def open_ac_page():
                 x, y = _center(b)
                 adb(f"input tap {x} {y}", 0.2)
                 return True
-    # Fallback: do a small tap where the setpoint sits
     adb("input tap 190 1005", 0.2)
     return True
 
-# ============ Climate page controls (Rapid heat / Rapid vent / Power) ============
+# ============ Climate page controls ============
 
 def _tap_by_id_on_current_dump(resource_id: str, remote="/sdcard/byd_ac.xml", local="/app/byd_ac.xml", delay=0.08) -> bool:
-    """
-    Re-dump the current screen (assumes Climate page is open), find a node by
-    resource-id, and tap its center. Returns True if a tap was sent.
-    """
     dump_xml(remote, local, wait=0.35)
     try:
         root = ET.parse(local).getroot()
@@ -640,62 +603,33 @@ def _tap_by_id_on_current_dump(resource_id: str, remote="/sdcard/byd_ac.xml", lo
     for n in root.iter("node"):
         if n.attrib.get("resource-id", "") == resource_id:
             m = BOUNDS_RX.search(n.attrib.get("bounds", "") or "")
-            if not m:
-                continue
+            if not m: continue
             x1, y1, x2, y2 = map(int, m.groups())
             x, y = ((x1 + x2) // 2, (y1 + y2) // 2)
             adb(f"input tap {x} {y}", delay)
             return True
-
-    print(f"[climate] resource-id not found: {resource_id}")
     return False
 
-
 def ac_rapid_heat():
-    """
-    Open Climate page → tap 'Rapid heating' → back.
-    """
-    if not open_ac_page():
-        print("[climate] cannot open A/C page")
-        return
-    ok = _tap_by_id_on_current_dump("com.byd.bydautolink:id/c_air_item_heat_btn")
-    if not ok:
-        print("[climate] Rapid heating button not found")
+    if not open_ac_page(): return
+    _tap_by_id_on_current_dump("com.byd.bydautolink:id/c_air_item_heat_btn")
     time.sleep(0.3)
     adb("input keyevent 4", 0.4)
-
 
 def ac_rapid_cool():
-    """
-    Open Climate page → tap 'Rapid cooling' (aka ventilation) → back.
-    """
-    if not open_ac_page():
-        print("[climate] cannot open A/C page")
-        return
-    ok = _tap_by_id_on_current_dump("com.byd.bydautolink:id/c_air_item_cool_btn")
-    if not ok:
-        print("[climate] Rapid cooling button not found")
+    if not open_ac_page(): return
+    _tap_by_id_on_current_dump("com.byd.bydautolink:id/c_air_item_cool_btn")
     time.sleep(0.3)
     adb("input keyevent 4", 0.4)
 
-
 def ac_switch_on():
-    """
-    Open Climate page → tap 'Switch on' → auto-enter PIN if prompted → publish power → back.
-    """
-    if not open_ac_page():
-        print("[climate] cannot open A/C page")
-        return
+    if not open_ac_page(): return
     ok = _tap_by_id_on_current_dump("com.byd.bydautolink:id/c_air_item_power_btn")
     if not ok:
-        print("[climate] Switch On button not found")
         adb("input keyevent 4", 0.3)
         return
-
-    # If BYD pops the PIN dialog, enter BYD_PIN (env) and wait for it to disappear
     ensure_pin_if_needed()
-
-    # Optional confirmation publish (read label 'switch on/off' under the power tile)
+    # Confirm state
     try:
         dump_xml("/sdcard/byd_ac.xml", "/app/byd_ac.xml", wait=0.5)
         root = ET.parse("/app/byd_ac.xml").getroot()
@@ -710,17 +644,9 @@ def ac_switch_on():
                 break
         if power:
             client.publish(f"{MQTT_TOPIC_BASE}/climate_power", power)
-            print(f"➡️ Publish {MQTT_TOPIC_BASE}/climate_power -> {power}")
     except Exception:
         pass
-
     adb("input keyevent 4", 0.4)
-
-def _as_float(s):
-    try:
-        return float(s)
-    except Exception:
-        return None
 
 def publish_values(vals: dict):
     if not vals:
@@ -729,16 +655,15 @@ def publish_values(vals: dict):
         client.publish(f"{MQTT_TOPIC_BASE}/{k}", v if isinstance(v, str) else json.dumps(v))
         print(f"➡️ Publish {MQTT_TOPIC_BASE}/{k} -> {v}")
 
-# ============ Command worker (executes queued MQTT button commands) ============
+# ============ Command worker ============
 
 def _command_worker():
     print("[worker] Command worker started")
     while True:
-        fn = CMD_Q.get()   # waits for a callable enqueued by on_mqtt_message
+        fn = CMD_Q.get()
         try:
-            # If the PIN prompt is up, enter it before running any action
             ensure_pin_if_needed()
-            fn()  # run the action (e.g., ac_temp_up / lock_car / ac_rapid_heat)
+            fn()
         except Exception as e:
             print(f"[worker] Command error: {e}")
         finally:
@@ -748,97 +673,84 @@ def main_loop():
     while True:
         cycle = {}
 
-        # --- HOME: dump & parse the basics (incl. A/C set temp on the card)
+        # --- HOME: Always polled ---
         home_xml = dump_xml("/sdcard/byd_home.xml", "/app/byd_home.xml")
         home_vals = extract_values_from_xml(home_xml)
         publish_values(home_vals)
         cycle.update(home_vals)
 
-        # --- VEHICLE STATUS: open, dump TOP+BOTTOM, parse, publish, back
-        top_xml, bottom_xml = dump_vehicle_status_two_pages()
-        if top_xml and bottom_xml:
-            status_vals = parse_vehicle_status_two_pages(top_xml, bottom_xml)
-            publish_values(status_vals)
-            cycle.update(status_vals)
-            adb("input keyevent 4", 0.5)  # back to home
+        # --- VEHICLE STATUS (Optional) ---
+        if PAGES_ENABLED["vehicle_status"]:
+            top_xml, bottom_xml = dump_vehicle_status_two_pages()
+            if top_xml and bottom_xml:
+                status_vals = parse_vehicle_status_two_pages(top_xml, bottom_xml)
+                publish_values(status_vals)
+                cycle.update(status_vals)
+                adb("input keyevent 4", 0.5)  # back to home
 
-        # --- GPS: open, read coords from text node near [83,153] trick from earlier, publish, back
-        if tap_by_label("Vehicle position"):
-            gps_xml = dump_xml("/sdcard/byd_gps.xml", "/app/byd_gps.xml", wait=0.6)
-            # Extract lat/lon directly from any node text containing "lat,lon"
-            try:
-                root = ET.parse(gps_xml).getroot()
-                for n in root.iter("node"):
-                    txt = (n.attrib.get("text") or "").strip()
-                    m = LATLON_RX.search(txt)
-                    if m:
-                        lat = float(m.group(1)); lon = float(m.group(2))
-                        payload = {"latitude": lat, "longitude": lon, "gps_accuracy": 10, "status": "driving"}
-                        client.publish(f"{MQTT_TOPIC_BASE}/location", json.dumps(payload))
-                        print(f"➡️ Publish {MQTT_TOPIC_BASE}/location -> {payload}")
-                        break
-            except Exception:
-                pass
-            adb("input keyevent 4", 0.5)  # back
-
-        # --- A/C page: open, parse prev/next and power label, publish, back
-        if open_ac_page():
-            ac_xml = dump_xml("/sdcard/byd_ac.xml", "/app/byd_ac.xml")
-            try:
-                root = ET.parse(ac_xml).getroot()
-            except Exception:
-                root = None
-            ac_vals = {}
-            # Current setpoint already exposed from home; prev/next are optional
-            if root is not None:
-                # Current setpoint text (same id)
-                for n in root.iter("node"):
-                    rid = n.attrib.get("resource-id") or ""
-                    if rid == "com.byd.bydautolink:id/tem_tv":
+        # --- GPS (Optional) ---
+        if PAGES_ENABLED["vehicle_position"]:
+            if tap_by_label("Vehicle position"):
+                gps_xml = dump_xml("/sdcard/byd_gps.xml", "/app/byd_gps.xml", wait=0.6)
+                try:
+                    root = ET.parse(gps_xml).getroot()
+                    for n in root.iter("node"):
                         txt = (n.attrib.get("text") or "").strip()
-                        try:
-                            ac_vals["climate_target_temp_c"] = float(txt)
-                        except ValueError:
-                            pass
-                        break
+                        m = LATLON_RX.search(txt)
+                        if m:
+                            lat = float(m.group(1)); lon = float(m.group(2))
+                            payload = {"latitude": lat, "longitude": lon, "gps_accuracy": 10, "status": "driving"}
+                            client.publish(f"{MQTT_TOPIC_BASE}/location", json.dumps(payload))
+                            print(f"➡️ Publish {MQTT_TOPIC_BASE}/location -> {payload}")
+                            break
+                except Exception:
+                    pass
+                adb("input keyevent 4", 0.5)  # back
 
-                # Previous/next temps (optional)
-                for n in root.iter("node"):
-                    rid = n.attrib.get("resource-id") or ""
-                    if rid == "com.byd.bydautolink:id/tem_tv_last":
-                        t = (n.attrib.get("text") or "").strip()
-                        if t.isdigit():
-                            ac_vals["climate_prev_temp_c"] = float(t)
-                    elif rid == "com.byd.bydautolink:id/tem_tv_next":
-                        t = (n.attrib.get("text") or "").strip()
-                        if t.isdigit():
-                            ac_vals["climate_next_temp_c"] = float(t)
+        # --- A/C (Optional) ---
+        if PAGES_ENABLED["ac"]:
+            if open_ac_page():
+                ac_xml = dump_xml("/sdcard/byd_ac.xml", "/app/byd_ac.xml")
+                try:
+                    root = ET.parse(ac_xml).getroot()
+                except Exception:
+                    root = None
+                ac_vals = {}
+                if root is not None:
+                    # Target temp
+                    for n in root.iter("node"):
+                        if n.attrib.get("resource-id") == "com.byd.bydautolink:id/tem_tv":
+                            try:
+                                ac_vals["climate_target_temp_c"] = float(n.attrib.get("text"))
+                            except: pass
+                    # Prev/Next
+                    for n in root.iter("node"):
+                        rid = n.attrib.get("resource-id") or ""
+                        txt = (n.attrib.get("text") or "").strip()
+                        if rid == "com.byd.bydautolink:id/tem_tv_last" and txt.isdigit():
+                            ac_vals["climate_prev_temp_c"] = float(txt)
+                        elif rid == "com.byd.bydautolink:id/tem_tv_next" and txt.isdigit():
+                            ac_vals["climate_next_temp_c"] = float(txt)
+                    # Power status
+                    power_label = None
+                    for n in root.iter("node"):
+                        if n.attrib.get("resource-id") == "com.byd.bydautolink:id/c_air_item_power_btn":
+                            for m in n.iter("node"):
+                                low = (m.attrib.get("text") or "").strip().lower()
+                                if low in ("switch on", "switch off"):
+                                    power_label = low; break
+                            break
+                    if power_label:
+                        ac_vals["climate_power"] = "on" if "on" in power_label else "off"
 
-                # Power (from label within c_air_item_power_btn)
-                power_label = None
-                for n in root.iter("node"):
-                    if n.attrib.get("resource-id") == "com.byd.bydautolink:id/c_air_item_power_btn":
-                        for m in n.iter("node"):
-                            low = (m.attrib.get("text") or "").strip().lower()
-                            if low in ("switch on", "switch off"):
-                                power_label = low
-                                break
-                        break
+                if ac_vals:
+                    publish_values(ac_vals)
+                    cycle.update(ac_vals)
+                adb("input keyevent 4", 0.5)
+            else:
+                print("⚠️ Could not open A/C page")
 
-                if power_label:
-                    ac_vals["climate_power"] = "on" if "on" in power_label else "off"
-
-            if ac_vals:
-                publish_values(ac_vals)
-                cycle.update(ac_vals)
-            adb("input keyevent 4", 0.5)
-        else:
-            print("⚠️ Could not open A/C page")
-
-        # Done this cycle
         time.sleep(POLL_SECONDS)
-
-# ============ Entrypoint ============
 
 if __name__ == "__main__":
     try:

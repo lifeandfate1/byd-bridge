@@ -1,5 +1,7 @@
 App# 🚗 BYD App Bridge (Wireless ADB + MQTT)
 
+![Banner](images/banner.png)
+
 A self-healing bridge that connects the official BYD Android App to Home Assistant.
 
 This project runs a Python script in a Docker container that communicates with a dedicated Android phone over **Wireless ADB**. It "scrapes" the UI of the BYD app to read sensors (Range, SoC, Tire Pressure, Location) and interacts with onscreen buttons to send commands (Lock, Unlock, AC).
@@ -7,35 +9,6 @@ This project runs a Python script in a Docker container that communicates with a
 ## 🏗️ Architecture
 
 The Python script does not handle the connection; it assumes the environment has a valid ADB session. The Docker container handles the Wireless ADB connection at startup.
-
-```mermaid
-graph LR
-    subgraph "Hardware"
-        Phone[Android Phone\n(Running BYD App)]
-    end
-
-    subgraph "Docker Host"
-        Container[Docker Container]
-        subgraph "Container Processes"
-            ADB_Server[ADB Server]
-            Python[Bridge Script]
-        end
-    end
-
-    subgraph "Smart Home"
-        MQTT((Mosquitto MQTT))
-        HA[Home Assistant]
-    end
-
-    Phone -.->|Wireless ADB (TCP:5555)| ADB_Server
-    ADB_Server <-->|Local Shell Commands| Python
-    Python <-->|MQTT Topics| MQTT
-    MQTT <-->|Auto Discovery| HA
-
-    style Phone fill:#e1f5fe,stroke:#01579b
-    style Container fill:#e8f5e9,stroke:#2e7d32
-    style HA fill:#fff3e0,stroke:#ef6c00
-```
 
 ## ✨ Key Features
 
@@ -49,6 +22,8 @@ graph LR
     * **Self-Healing:** If the UI dump fails 3 times (ADB instability), it performs a `force-stop` and restarts the BYD app automatically.
     * **Ghosting Protection:** Filters out placeholder values (`--`, `---`) so Home Assistant history remains clean.
     * **Race Condition Locking:** A global sequence lock prevents commands from firing while the screen is being swiped/read.
+
+![Architecture Diagram](images/diagram.png)
 
 ## 📋 Prerequisites
 

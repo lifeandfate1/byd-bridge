@@ -488,6 +488,7 @@ def parse_vehicle_status_two_pages():
         adb("input keyevent 4"); return {}
 
     if not tap_by_label("Vehicle status"): return {}
+    time.sleep(1.5) # Allow page to load
     
     top = dump_xml(remote="/sdcard/st1.xml", local="/app/st1.xml")
     if is_command_pending(): 
@@ -591,7 +592,7 @@ def ac_switch_on():
 
 def publish_values(vals: dict):
     if not vals: 
-        print("⚠️ XML Parsed but 0 matching values found. (Layout mismatch?)")
+        print("⚠️ XML Parsed but 0 matching values found. (Layout mismatch or Loading Screen)")
         return
     for k, v in vals.items():
         print(f"➡️  {k}: {v}")
@@ -672,6 +673,7 @@ def main_loop():
         if PAGES_ENABLED["ac"] and mode != "IDLE":
              with SEQUENCE_LOCK:
                  if open_ac_page():
+                     time.sleep(1.5) # Allow page to load
                      ac_xml = dump_xml("/sdcard/ac_full.xml", "/app/ac_full.xml")
                      if ac_xml:
                          ac_vals = extract_values_from_xml(ac_xml)

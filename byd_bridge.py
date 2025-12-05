@@ -49,27 +49,15 @@ KM_RX       = re.compile(r"^\s*([\d,]+)\s*km\s*$", re.IGNORECASE)
 KWH100_RX   = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*kW\s*·?\s*h/100km\s*$", re.IGNORECASE)
 LATLON_RX   = re.compile(r"(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)")
 
-# ============ MQTT ============
+# ============ MQTT Discovery Logic ============
 
-def connect_mqtt():
-    client = mqtt.Client()
-    client.username_pw_set(MQTT_USER, MQTT_PASS)
-    # Last Will so HA shows offline if we die unexpectedly
-    client.will_set(f"{MQTT_TOPIC_BASE}/availability", "offline", retain=True)
-    client.on_disconnect = lambda c, u, rc: print(f"⚠️ MQTT disconnected (rc={rc})")
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    client.loop_start()
-    # Mark online after connect
-    client.publish(f"{MQTT_TOPIC_BASE}/availability", "online", retain=True)
-    return client
-
-client = connect_mqtt()
-
-def publish_discovery_once():
+def publish_discovery(client):
     """
     Publish Home Assistant MQTT Discovery for all metrics AND action buttons.
     Safe to call multiple times (retained configs).
     """
+    print("[MQTT] Sending Home Assistant Discovery payloads...")
+    
     device = {
         "identifiers": [DEVICE_ID],
         "name": DEVICE_NAME,
@@ -157,10 +145,36 @@ def publish_discovery_once():
     disc_button("BYD Rapid Heat",      "byd_cmd_climate_heat",    f"{MQTT_TOPIC_BASE}/cmd/climate_rapid_heat", icon="mdi:fire")
     disc_button("BYD Rapid Vent",      "byd_cmd_climate_vent",    f"{MQTT_TOPIC_BASE}/cmd/climate_rapid_vent", icon="mdi:fan")
     disc_button("BYD A/C Switch On",   "byd_cmd_climate_on",      f"{MQTT_TOPIC_BASE}/cmd/climate_switch_on",  icon="mdi:power")
+    
+    print("[MQTT] Discovery payloads sent.")
 
+# ============ MQTT Connection Setup ============
 
-# Publish discovery once at startup
-publish_discovery_once()
+def on_connect(client, userdata, flags, rc):
+    print(f"[MQTT] Connected with result code {rc}")
+    # Mark online
+    client.publish(f"{MQTT_TOPIC_BASE}/availability", "online", retain=True)
+    # Send Discovery EVERY time we connect, to ensure HA sees it
+    publish_discovery(client)
+
+def connect_mqtt():
+    client = mqtt.Client()
+    if MQTT_USER and MQTT_PASS:
+        client.username_pw_set(MQTT_USER, MQTT_PASS)
+    
+    # Last Will so HA shows offline if we die unexpectedly
+    client.will_set(f"{MQTT_TOPIC_BASE}/availability", "offline", retain=True)
+    
+    client.on_connect = on_connect
+    client.on_disconnect = lambda c, u, rc: print(f"⚠️ MQTT disconnected (rc={rc})")
+    
+    print(f"[MQTT] Connecting to {MQTT_BROKER}...")
+    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    client.loop_start()
+    return client
+
+# Initialize Client
+client = connect_mqtt()
 
 # ============ MQTT command handling (home page + climate page) ============
 def on_mqtt_message(client, userdata, msg):
@@ -841,4 +855,3 @@ if __name__ == "__main__":
             client.disconnect()
         except Exception:
             pass
-

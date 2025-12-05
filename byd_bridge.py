@@ -23,10 +23,10 @@ DEVICE_ID        = os.getenv("BYD_DEVICE_ID", "byd-app-phone")
 DEVICE_NAME      = os.getenv("BYD_DEVICE_NAME", "BYD App Bridge")
 
 # --- Polling Intervals (Adaptive) ---
-POLL_ACTIVE_SECONDS   = int(os.getenv("POLL_SECONDS", "60"))          # Normal usage
-POLL_CHARGING_SECONDS = int(os.getenv("POLL_CHARGING_SECONDS", "30")) # While charging (faster updates)
-POLL_IDLE_SECONDS     = int(os.getenv("POLL_IDLE_SECONDS", "600"))    # Parked & asleep (10 mins)
-IDLE_TIMEOUT_MINS     = 15                                            # Mins of inactivity before switching to IDLE
+POLL_ACTIVE_SECONDS   = int(os.getenv("POLL_SECONDS", "60"))
+POLL_CHARGING_SECONDS = int(os.getenv("POLL_CHARGING_SECONDS", "30"))
+POLL_IDLE_SECONDS     = int(os.getenv("POLL_IDLE_SECONDS", "600"))
+IDLE_TIMEOUT_MINS     = 15
 
 # --- Page selection flags ---
 POLL_VEHICLE_STATUS    = int(os.getenv("POLL_VEHICLE_STATUS", "1"))
@@ -41,14 +41,13 @@ PAGES_ENABLED = {
 }
 
 # ---- State Tracking ----
-ADB_LOCK = threading.RLock()       # Low-level lock for individual ADB commands
-SEQUENCE_LOCK = threading.RLock()  # High-level lock for Page Sequences (prevents interleaving)
-
+ADB_LOCK = threading.RLock()
+SEQUENCE_LOCK = threading.RLock()
 CMD_Q = queue.Queue()
-WAKE_EVENT = threading.Event()  # To interrupt sleep for instant commands
+WAKE_EVENT = threading.Event()
 
 GLOBAL_STATE = {
-    "last_command_time": 0,
+    "last_command_time": time.time(), # Start in ACTIVE mode
     "is_charging": False,
     "consecutive_errors": 0,
     "last_valid_data_time": time.time(),
@@ -67,7 +66,6 @@ XML_MAP = {
     "com.byd.bydautolink:id/tv_update_time":       "last_update",
 }
 
-# Regex helpers
 BOUNDS_RX   = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
 PSI_RX      = re.compile(r"^\s*(\d{2}\.\d)\s*psi\s*$", re.IGNORECASE)
 KM_RX       = re.compile(r"^\s*([\d,]+)\s*km\s*$", re.IGNORECASE)
@@ -83,57 +81,41 @@ def adb(cmd: str, wait: float = 0.5):
         time.sleep(wait)
 
 def restart_app():
-    """Self-healing: Force stop and restart the BYD app."""
     print("🚑 [Self-Healing] App seems stuck. Restarting BYD App...")
     adb("am force-stop com.byd.bydautolink")
     time.sleep(2)
-    # Use monkey to launch the app (works without knowing exact Activity class)
     adb("monkey -p com.byd.bydautolink -c android.intent.category.LAUNCHER 1")
-    time.sleep(15) # Wait for cold boot load
+    time.sleep(15)
     GLOBAL_STATE["consecutive_errors"] = 0
     print("🚑 [Self-Healing] Restart command sent.")
 
 def dump_xml(remote="/sdcard/_byd_ui.xml", local="/app/_byd_ui.xml", wait=0.8):
-    """
-    Dumps UI XML. Returns local path if successful, None if failed.
-    Tracks consecutive errors to trigger self-healing.
-    """
     with ADB_LOCK:
-        # cleanup old
         if os.path.exists(local): os.remove(local)
-        
-        # dump to phone
         subprocess.run(["adb", "shell", "uiautomator", "dump", remote], 
                        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.2)
-        
-        # pull to container
         subprocess.run(["adb", "pull", remote, local],
                        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # Validation
     if os.path.exists(local) and os.path.getsize(local) > 0:
-        # Basic check for valid XML structure
         try:
             ET.parse(local)
             GLOBAL_STATE["consecutive_errors"] = 0
             GLOBAL_STATE["last_valid_data_time"] = time.time()
             return local
         except ET.ParseError:
-            pass # corrupted file
+            pass 
     
-    # Error handling
     GLOBAL_STATE["consecutive_errors"] += 1
     err_count = GLOBAL_STATE["consecutive_errors"]
     print(f"⚠️ UI Dump failed (Attempt {err_count}/3)")
     
     if err_count >= 3:
         restart_app()
-    
     return None
 
 def is_command_pending():
-    """Checks if a high-priority command is waiting in the queue."""
     return not CMD_Q.empty()
 
 # ============ MQTT Discovery ============
@@ -284,15 +266,13 @@ def extract_values_from_xml(local_xml_path):
         rid = node.attrib.get("resource-id", "")
         txt = (node.attrib.get("text") or "").strip()
         
-        # Ghosting Protection: Skip empty or placeholder values
+        # Ghosting Protection
         if not txt or txt == "--" or txt == "---":
-            # Don't skip if we are checking power label logic inside children
             if rid != "com.byd.bydautolink:id/c_air_item_power_btn":
                 continue
 
         if rid in XML_MAP:
             key = XML_MAP[rid]
-            # Capture charging status specifically for adaptive polling
             if key == "charging_tip":
                 if "charging" in txt.lower() or "remaining" in txt.lower():
                     GLOBAL_STATE["is_charging"] = True
@@ -311,22 +291,15 @@ def extract_values_from_xml(local_xml_path):
             else:
                 vals[key] = txt
 
-        # --- RESTORED LOGIC FROM ORIGINAL FILE ---
-        
-        # 1. AC Previous / Next Temp (Specific IDs not in global map)
         if rid == "com.byd.bydautolink:id/tem_tv_last" and txt.isdigit():
              vals["climate_prev_temp_c"] = float(txt)
         elif rid == "com.byd.bydautolink:id/tem_tv_next" and txt.isdigit():
              vals["climate_next_temp_c"] = float(txt)
         
-        # 2. AC Power Status (Nested Text check)
-        # The text "Switch on" or "Switch off" is deeply nested inside this button
         if rid == "com.byd.bydautolink:id/c_air_item_power_btn":
             for m in node.iter("node"):
                 low = (m.attrib.get("text") or "").strip().lower()
                 if low in ("switch on", "switch off"):
-                    # If button says "Switch on", current state is OFF
-                    # If button says "Switch off", current state is ON
                     vals["climate_power"] = "on" if "on" in low else "off"
                     break
 
@@ -335,12 +308,7 @@ def extract_values_from_xml(local_xml_path):
 # ============ Actions ============
 
 def go_home(max_retries=3):
-    """
-    Ensures the app is on the Home screen.
-    Returns True if on Home, False if failed.
-    """
     for i in range(max_retries):
-        # Dump and check for a home-specific element (e.g., Range KM textview id)
         local = dump_xml(remote="/sdcard/_check_home.xml", local="/app/_check_home.xml", wait=0.3)
         if not local: continue
         
@@ -348,10 +316,8 @@ def go_home(max_retries=3):
         try:
             root = ET.parse(local).getroot()
             for n in root.iter("node"):
-                # "h_km_tv" is unique to the home screen dashboard
                 if n.attrib.get("resource-id") == "com.byd.bydautolink:id/h_km_tv":
                     found = True; break
-                # Fallback: check for "My car" text in tab bar?
                 if _text(n) == "My car" and "tab" in (n.attrib.get("resource-id") or ""):
                     found = True; break
         except: pass
@@ -360,7 +326,7 @@ def go_home(max_retries=3):
             return True
         
         print(f"🔄 Not on Home screen. Pressing Back (Attempt {i+1})...")
-        adb("input keyevent 4", 0.3) # Back button
+        adb("input keyevent 4", 0.3) 
     
     print("⚠️ Failed to reach Home screen after retries.")
     return False
@@ -368,7 +334,7 @@ def go_home(max_retries=3):
 def tap_by_label(label: str):
     local = "/app/_byd_home.xml"
     if not os.path.exists(local):
-        dump_xml(local=local) # try fresh dump if missing
+        dump_xml(local=local)
     
     try:
         root = ET.parse(local).getroot()
@@ -376,7 +342,6 @@ def tap_by_label(label: str):
         return False
 
     target = None
-    # DFS search for text
     def walk(n, path):
         nonlocal target
         if _text(n) == label:
@@ -390,22 +355,18 @@ def tap_by_label(label: str):
         print(f"tap_by_label: '{label}' not found")
         return False
 
-    # RESTORED: STRICT Priority logic from byd_bridge_selector.py
-    # 1. Content Group ancestor (The "Card")
     b = None
-    for n in reversed(target[:-1]): # Ancestors only
+    for n in reversed(target[:-1]): 
         if "content_group" in (n.attrib.get("resource-id") or ""):
             b = _bounds_str_to_tuple(n.attrib.get("bounds")); 
             if b: break
     
-    # 2. Clickable Ancestor (if Card not found)
     if not b:
         for n in reversed(target[:-1]):
             if n.attrib.get("clickable") == "true":
                 b = _bounds_str_to_tuple(n.attrib.get("bounds")); 
                 if b: break
                 
-    # 3. Self (Last resort)
     if not b:
         b = _bounds_str_to_tuple(target[-1].attrib.get("bounds"))
 
@@ -415,7 +376,7 @@ def tap_by_label(label: str):
         return True
     return False
 
-# ... PIN and other helpers ...
+# ... PIN helpers ...
 PIN_CODE = os.getenv("BYD_PIN", "").strip()
 PIN_TAPS = {
     "1": (170,  680), "2": (360,  680), "3": (550,  680),
@@ -425,14 +386,10 @@ PIN_TAPS = {
 }
 
 def ensure_pin_if_needed():
-    # Only check if PIN_CODE is configured
     if not PIN_CODE: return
-    
-    # Check current screen for PIN dialog (simplified check)
     local = "/app/_pin_check.xml"
     if not dump_xml(remote="/sdcard/_byd_pin.xml", local=local, wait=0.3):
         return
-
     is_pin = False
     try:
         root = ET.parse(local).getroot()
@@ -443,7 +400,7 @@ def ensure_pin_if_needed():
 
     if is_pin:
         print("🔐 PIN Prompt detected. Entering PIN...")
-        adb(f"input tap 360 1245", 0.1) # tap text area
+        adb(f"input tap 360 1245", 0.1) 
         for ch in PIN_CODE:
             if ch in PIN_TAPS:
                 x,y = PIN_TAPS[ch]
@@ -512,7 +469,7 @@ def nearest_value_above(items, label_text, value_regex=None):
         m = BOUNDS_RX.search(b or "")
         if not m: continue
         coords = tuple(map(int, m.groups()))
-        if coords[1] >= label_bounds[3]: # below label
+        if coords[1] >= label_bounds[3]: 
             if value_regex and not value_regex.match(t): continue
             cand.append((coords[1], coords[0], t))
     
@@ -522,10 +479,9 @@ def nearest_value_above(items, label_text, value_regex=None):
     return None
 
 def parse_vehicle_status_two_pages():
-    # Attempt to swipe and dump, but yield if command pending
     adb("input swipe 333 316 333 948 250", 0.2)
     if is_command_pending(): 
-        adb("input keyevent 4"); return {} # Abort, back to home
+        adb("input keyevent 4"); return {}
 
     adb("input swipe 333 948 333 316 350", 0.5)
     if is_command_pending(): 
@@ -533,14 +489,12 @@ def parse_vehicle_status_two_pages():
 
     if not tap_by_label("Vehicle status"): return {}
     
-    # Dump 1
     top = dump_xml(remote="/sdcard/st1.xml", local="/app/st1.xml")
     if is_command_pending(): 
         adb("input keyevent 4"); return {}
 
     adb("input swipe 333 948 333 316 450", 0.6)
     
-    # Dump 2
     bot = dump_xml(remote="/sdcard/st2.xml", local="/app/st2.xml")
     
     vals = {}
@@ -549,28 +503,29 @@ def parse_vehicle_status_two_pages():
 
     items = gather_items(top) + gather_items(bot)
     
-    # Tires
+    # Tires - Extract the NUMBER, not the text
     tyres = []
     for t,b in items:
-        if PSI_RX.match(t):
-            m = BOUNDS_RX.search(b or "")
-            if m: tyres.append((int(m.group(2)), int(m.group(1)), t))
-    tyres.sort() # Sort by Y then X
+        m_psi = PSI_RX.match(t)
+        if m_psi:
+            m_bounds = BOUNDS_RX.search(b or "")
+            if m_bounds: 
+                # Extract float value of PSI to be clean
+                val = m_psi.group(1) 
+                tyres.append((int(m_bounds.group(2)), int(m_bounds.group(1)), val))
+    tyres.sort() 
     if len(tyres) >= 4:
         vals["tire_pressure_fl"] = tyres[0][2]
         vals["tire_pressure_fr"] = tyres[1][2]
         vals["tire_pressure_rl"] = tyres[2][2]
         vals["tire_pressure_rr"] = tyres[3][2]
 
-    # Map
     lmap = {"Front hood":"front_bonnet", "Door":"doors", "Window":"windows", "Trunk":"boot",
             "Whole vehicle":"whole_vehicle_status", "Driving status":"driving_status", "Odometer":"odometer",
             "Recent energy": "byd_recent_energy", "Total energy": "byd_total_energy"}
     
     for lab, k in lmap.items():
-        # Apply strict regex for Energy stats so we don't grab "kWh/100km" unit label
         regex = KWH100_RX if "energy" in k else None
-        
         v = nearest_value_above(items, lab, value_regex=regex)
         if v and v not in ("--", "---"):
             if k == "odometer":
@@ -613,10 +568,7 @@ def ac_action(res_id):
 def ac_rapid_heat(): ac_action("com.byd.bydautolink:id/c_air_item_heat_btn")
 def ac_rapid_cool(): ac_action("com.byd.bydautolink:id/c_air_item_cool_btn")
 def ac_switch_on(): 
-    # RESTORED: Special logic for AC On/Off confirmation
     if not open_ac_page(): return
-    
-    # 1. Tap Power Button
     path = dump_xml(remote="/sdcard/ac.xml", local="/app/ac.xml")
     if path:
         try:
@@ -627,23 +579,22 @@ def ac_switch_on():
                      if b: adb(f"input tap {_center(b)[0]} {_center(b)[1]}")
         except: pass
         
-    # 2. Check PIN
     ensure_pin_if_needed()
-    
-    # 3. Confirm State (Immediate Feedback Loop)
-    time.sleep(1.0) # Wait for animation
+    time.sleep(1.0)
     path = dump_xml(remote="/sdcard/ac.xml", local="/app/ac.xml")
     if path:
         ac_vals = extract_values_from_xml(path)
         if "climate_power" in ac_vals:
             print(f"✅ AC State Confirmed: {ac_vals['climate_power']}")
             client.publish(f"{MQTT_TOPIC_BASE}/climate_power", ac_vals["climate_power"])
-
     adb("input keyevent 4")
 
 def publish_values(vals: dict):
-    if not vals: return
+    if not vals: 
+        print("⚠️ XML Parsed but 0 matching values found. (Layout mismatch?)")
+        return
     for k, v in vals.items():
+        print(f"➡️  {k}: {v}")
         client.publish(f"{MQTT_TOPIC_BASE}/{k}", v if isinstance(v, str) else json.dumps(v))
 
 # ============ Main Loops ============
@@ -653,19 +604,11 @@ def _command_worker():
         fn = CMD_Q.get()
         try:
             GLOBAL_STATE["last_command_time"] = time.time()
-            # WAIT for the sequence lock (Main loop must finish or yield)
             with SEQUENCE_LOCK:
                 print("[worker] Executing Priority Command...")
-                # 1. Force Home to ensure known state
                 go_home()
-                
-                # 2. Check PIN
                 ensure_pin_if_needed()
-                
-                # 3. Execute
                 fn()
-            
-            # Instant Wake: Signal main loop to poll immediately for feedback
             WAKE_EVENT.set()
         except Exception as e:
             print(f"[worker] Error: {e}")
@@ -676,7 +619,6 @@ def main_loop():
     print(f"🚀 Bridge Started. Active Poll: {POLL_ACTIVE_SECONDS}s, Idle: {POLL_IDLE_SECONDS}s")
     
     while True:
-        # 1. Determine Polling Mode
         now = time.time()
         time_since_cmd = now - GLOBAL_STATE["last_command_time"]
         
@@ -690,11 +632,9 @@ def main_loop():
             mode = "IDLE"
             sleep_time = POLL_IDLE_SECONDS
         
-        # 2. Perform Poll (Protected by Sequence Lock)
         print(f"🔄 Polling ({mode})...")
         cycle_vals = {}
 
-        # HOME (Always) - Small atomic block
         with SEQUENCE_LOCK:
             home_xml = dump_xml("/sdcard/byd_home.xml", "/app/byd_home.xml")
             if home_xml:
@@ -702,20 +642,16 @@ def main_loop():
                 publish_values(home_vals)
                 cycle_vals.update(home_vals)
         
-        # Check command queue before starting next big block
         if not CMD_Q.empty(): 
             print("⏳ Yielding for command...")
             time.sleep(1); continue
 
-        # Vehicle Status (if enabled)
         if PAGES_ENABLED["vehicle_status"] and mode != "IDLE": 
             with SEQUENCE_LOCK:
-                # This function now internally checks for commands and returns early
                 vals = parse_vehicle_status_two_pages()
                 publish_values(vals)
                 cycle_vals.update(vals)
 
-        # GPS (if enabled)
         if PAGES_ENABLED["vehicle_position"] and mode != "IDLE":
              with SEQUENCE_LOCK:
                 if tap_by_label("Vehicle position"):
@@ -733,7 +669,6 @@ def main_loop():
                         except: pass
                     adb("input keyevent 4")
         
-        # AC (if enabled)
         if PAGES_ENABLED["ac"] and mode != "IDLE":
              with SEQUENCE_LOCK:
                  if open_ac_page():
@@ -743,12 +678,9 @@ def main_loop():
                          publish_values(ac_vals)
                      adb("input keyevent 4")
 
-        # 3. Smart Sleep
-        # Wait for 'sleep_time' OR until a command wakes us up
         if WAKE_EVENT.wait(timeout=sleep_time):
             print("⚡ Woke up for command feedback!")
             WAKE_EVENT.clear()
-            # Loop immediately triggers next poll
 
 if __name__ == "__main__":
     try:

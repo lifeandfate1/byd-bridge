@@ -1,196 +1,127 @@
-# BYD App → MQTT Bridge (Docker + ADB over TCP)
+App# 🚗 BYD App Bridge (Wireless ADB + MQTT)
 
-Scrape live data from the **BYD Auto** Android app using **ADB** + **uiautomator**, then publish values to **MQTT** for consumption by **Home Assistant** (or any MQTT client).
+A self-healing bridge that connects the official BYD Android App to Home Assistant.
 
-This container:
-- Connects to your Android phone via **ADB over TCP**
-- Drives/taps the BYD app UI (screen scraping)
-- Dumps the current UI to XML and parses known fields
-- Publishes readings to MQTT topics like `byd/app/battery_soc` and a JSON location to `byd/app/location`
+This project runs a Python script in a Docker container that communicates with a dedicated Android phone over **Wireless ADB**. It "scrapes" the UI of the BYD app to read sensors (Range, SoC, Tire Pressure, Location) and interacts with onscreen buttons to send commands (Lock, Unlock, AC).
 
----
+## 🏗️ Architecture
 
-## ✨ Features
-- Containerized: no host Python/ADB setup needed
-- Works over **Wi-Fi ADB** (no USB passthrough)
-- Per-sensor MQTT topics + GPS JSON
-- GitHub Actions workflow included to build/publish to **GHCR**
-- Portainer-friendly via external `.env`
+The Python script does not handle the connection; it assumes the environment has a valid ADB session. The Docker container handles the Wireless ADB connection at startup.
 
----
+```mermaid
+graph LR
+    subgraph "Hardware"
+        Phone[Android Phone\n(Running BYD App)]
+    end
 
-## 🧠 How It Works (High Level)
-1. Container starts **ADB**, optionally pairs (Android 11+), then `adb connect PHONE_IP:ADB_PORT`.
-2. Python script performs taps/swipes via `adb shell input ...` to reveal data in the BYD app.
-3. UI is dumped with `uiautomator dump` and pulled into the container.
-4. Known Android `resource-id`s are parsed and published to MQTT as individual topics plus a device-tracker style JSON.
+    subgraph "Docker Host"
+        Container[Docker Container]
+        subgraph "Container Processes"
+            ADB_Server[ADB Server]
+            Python[Bridge Script]
+        end
+    end
 
-> ⚠️ **Screen scraping is fragile**: app updates or different screen sizes/DPI may require adjusting the tap/swipe coordinates or the `XML_MAP`.
+    subgraph "Smart Home"
+        MQTT((Mosquitto MQTT))
+        HA[Home Assistant]
+    end
 
----
+    Phone -.->|Wireless ADB (TCP:5555)| ADB_Server
+    ADB_Server <-->|Local Shell Commands| Python
+    Python <-->|MQTT Topics| MQTT
+    MQTT <-->|Auto Discovery| HA
 
-## 📁 Repository Layout
-.
-├─ Dockerfile
-├─ requirements.txt
-├─ entrypoint.sh
-├─ byd_mqtt_bridge.py
-└─ .github/
-└─ workflows/
-└─ build.yml
+    style Phone fill:#e1f5fe,stroke:#01579b
+    style Container fill:#e8f5e9,stroke:#2e7d32
+    style HA fill:#fff3e0,stroke:#ef6c00
+```
 
-yaml
-Copy code
+## ✨ Key Features
 
-- **Dockerfile**: Python 3.12-slim + Android platform-tools (ADB)
-- **entrypoint.sh**: starts ADB, (optional) pairs, connects, launches Python
-- **byd_mqtt_bridge.py**: scraper + MQTT publisher (reads config from env)
-- **build.yml**: CI to build & push `ghcr.io/<USER>/byd-bridge`
+* **⚡ Adaptive Polling Engine:**
+    * **Driving:** Polls every **60s** (configurable).
+    * **Charging:** Detects charging state (via UI text) and speeds up to **30s**.
+    * **Idle:** Slows down to **10 mins** if parked for >15 mins to save battery.
+    * **Instant Wake:** Command queue interrupts polling immediately to execute actions (e.g., Unlock).
 
----
+* **🛡️ Robustness:**
+    * **Self-Healing:** If the UI dump fails 3 times (ADB instability), it performs a `force-stop` and restarts the BYD app automatically.
+    * **Ghosting Protection:** Filters out placeholder values (`--`, `---`) so Home Assistant history remains clean.
+    * **Race Condition Locking:** A global sequence lock prevents commands from firing while the screen is being swiped/read.
 
-## ✅ Prerequisites
-- Android phone with **BYD Auto** app, logged in and able to show vehicle data
-- **Developer options** enabled on the phone
-- One-time **ADB over Wi-Fi** setup (below)
-- MQTT broker reachable from the container (e.g., Mosquitto)
-- (Optional) Home Assistant to consume MQTT topics
+## 📋 Prerequisites
 
----
+1.  **Dedicated Android Phone:**
+    * **Developer Options** enabled.
+    * **USB Debugging** enabled.
+    * **Screen Timeout** set to "Never" (or "Stay Awake" in Dev Options).
+    * BYD App installed and logged in (tick "Remember Me").
+2.  **Network:**
+    * The phone must be on the same network as the Docker host.
+    * You need the phone's **Static IP Address**.
 
-## 📶 One-Time: Enable ADB over Wi-Fi
+## ⚙️ Setup Instructions
 
-Choose **one** of the following:
+### Phase 1: Enable Wireless ADB (The "Tethered" Step)
+*You only need to do this once per phone reboot.*
 
-### Option A — Classic TCP/IP (simplest)
-```bash
-# On a machine with adb installed; connect phone via USB first
-adb devices                   # accept RSA prompt on the phone
-adb tcpip 5555
-adb connect PHONE_IP:5555
-adb devices                   # should show PHONE_IP:5555 device
-Unplug USB. The container will connect over TCP on each start.
+1.  Connect the phone to your computer (or Docker host) via **USB cable**.
+2.  Open a terminal/command prompt.
+3.  Run the command to switch ADB to TCP/IP mode:
+    ```bash
+    adb tcpip 5555
+    ```
+4.  **Unplug the USB cable.** The phone is now listening for wireless connections.
 
-Option B — Wireless Debugging Pairing (Android 11+)
-On the phone: Developer options → Wireless debugging → Pair device with pairing code.
-You’ll use the shown IP:port and pairing code as env vars ADB_PAIR_IP_PORT and ADB_PAIR_CODE.
+### Phase 2: Deploy Container
+The container is configured to automatically connect to the phone IP on startup.
 
-🚀 Deploy with Docker Compose (local or Portainer)
-Create an env file (don’t commit secrets):
+1.  Place `byd_bridge.py` and `docker-compose.yml` in a folder.
+2.  Edit `docker-compose.yml` (see Configuration below) and set your `PHONE_IP`.
+3.  Start the bridge:
+    ```bash
+    docker-compose up -d
+    ```
 
-byd-bridge.env
+### Phase 3: Home Assistant
+Go to **Settings > Devices & Services > MQTT**. A new device **BYD App Bridge** will appear automatically.
 
-env
-Copy code
-# --- Phone ADB over TCP ---
-PHONE_IP=192.168.1.123
-ADB_PORT=5555
+## 🔧 Configuration
 
-# Optional: Wireless Debugging pairing (Android 11+)
-# ADB_PAIR_IP_PORT=192.168.1.123:37099
-# ADB_PAIR_CODE=123456
+### Docker Environment Variables
 
-# --- MQTT ---
-MQTT_BROKER=192.168.1.40
-MQTT_PORT=1883
-MQTT_USER=user
-MQTT_PASS=password
-MQTT_TOPIC_BASE=byd/app
-docker-compose.yml
+#### Connection
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `PHONE_IP` | *None* | **Required.** The LAN IP of your Android phone (e.g., `192.168.1.55`). |
+| `MQTT_BROKER` | `192.168.1.40` | IP of MQTT Broker. |
+| `MQTT_USER` / `_PASS` | *None* | MQTT Credentials. |
 
-yaml
-Copy code
-version: "3.8"
-services:
-  byd-bridge:
-    image: ghcr.io/lifeandfate1/byd-bridge:latest
-    container_name: byd-bridge
-    env_file:
-      - byd-bridge.env
-    restart: unless-stopped
-    # If container → phone routing is blocked by your network, try:
-    # network_mode: host
-Start / view logs:
+#### Polling Logic
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `POLL_SECONDS` | `60` | Loop interval when active. |
+| `POLL_CHARGING_SECONDS` | `30` | Loop interval when "Charging" text is detected. |
+| `POLL_IDLE_SECONDS` | `600` | Loop interval when inactive for >15 mins. |
 
-bash
-Copy code
-docker compose up -d
-docker logs -f byd-bridge
-Expected logs:
+#### Features (1=On, 0=Off)
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `POLL_VEHICLE_STATUS` | `1` | Scrapes Tire Pressure/Doors page. |
+| `POLL_AC` | `1` | Scrapes AC page. |
+| `POLL_VEHICLE_POSITION`| `1` | Scrapes GPS page. |
+| `BYD_PIN` | *None* | **Required for Actions.** Your car's PIN code. |
 
-adb start-server
+## 🛠️ Troubleshooting
 
-adb connect <PHONE_IP>:5555
+**Q: The container loops with "Host is down" or "Connection refused".**
+* **Cause:** The phone is not in TCP/IP mode.
+* **Fix:** You must plug the phone into USB and run `adb tcpip 5555` again (Phase 1). This resets if the phone reboots.
 
-ADB device list
+**Q: "Unauthorized" in logs.**
+* **Cause:** The phone received the connection request but you didn't click "Allow" on the screen.
+* **Fix:** Unlock the phone screen, restart the container, and watch for the "Allow USB Debugging?" popup. Check "Always allow".
 
-Periodic “Publish … -> …” lines for MQTT topics
-
-🧪 Home Assistant Examples
-Individual MQTT Sensors
-sensor:
-  - platform: mqtt
-    name: "BYD Battery SoC"
-    state_topic: "byd/app/battery_soc"
-    value_template: "{{ value | replace('%','') | int }}"
-    unit_of_measurement: "%"
-    device_class: battery
-    unique_id: byd_battery_soc
-
-  - platform: mqtt
-    name: "BYD Range"
-    state_topic: "byd/app/range_km"
-    value_template: "{{ value | regex_replace('km','') | trim | int }}"
-    unit_of_measurement: "km"
-    unique_id: byd_range_km
-
-  - platform: mqtt
-    name: "BYD Odometer"
-    state_topic: "byd/app/odometer"
-    value_template: >
-      {{ value | regex_replace('km','') | replace(',','') | trim | int }}
-    unit_of_measurement: "km"
-    icon: mdi:counter
-    unique_id: byd_odometer
-
-Device Tracker from JSON Location
-mqtt:
-  device_tracker:
-    - state_topic: "byd/app/location"
-      json_attributes_topic: "byd/app/location"
-      source_type: gps
-      unique_id: byd_location_tracker
-
-
-The container publishes:
-
-{"latitude": -37.8136, "longitude": 144.9631, "gps_accuracy": 10, "status": "driving"}
-
-🔧 Configuration & Tuning
-
-Polling interval: edit time.sleep(60) near the end of main_loop() in byd_mqtt_bridge.py.
-
-UI mapping: update XML_MAP if the BYD app’s resource-ids change.
-
-Tap/swipe coordinates: adjust ACTIONS to match your phone’s screen size/DPI.
-
-🐞 Troubleshooting
-
-unauthorized in logs: unlock the phone and accept the ADB trust prompt; restart the container.
-
-adb connect fails: confirm PHONE_IP, same LAN, ADB enabled; make sure you ran adb tcpip 5555 once (classic TCP). Try network_mode: host if needed.
-
-No values published: BYD app must be foreground and screen awake.
-Manual test inside the container:
-
-docker exec -it byd-bridge sh
-adb shell uiautomator dump /sdcard/x.xml
-adb shell ls -l /sdcard/x.xml
-adb pull /sdcard/x.xml .
-
-
-Open x.xml and verify expected resource-ids exist.
-
-Only some fields appear: add another swipe_up or tweak tap coordinates.
-
-HA sensors stay unknown: verify MQTT broker/creds and topic names in your HA config.
+**Q: Sensors are unavailable.**
+* Check the logs (`docker logs byd-bridge`). If the script cannot dump the XML, it won't publish data.

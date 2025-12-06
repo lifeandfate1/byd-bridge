@@ -486,15 +486,20 @@ def parse_vehicle_status_two_pages():
     adb("input swipe 333 948 333 316 350", 0.5)
     if is_command_pending(): 
         adb("input keyevent 4"); return {}
+    
+    # FIX 1: Stabilize after swipe to ensure tap hits target
+    time.sleep(1.0) 
 
     if not tap_by_label("Vehicle status"): return {}
-    time.sleep(1.5) # Allow page to load
+    # FIX 2: Increased loading wait from 1.5s to 3.5s
+    time.sleep(3.5) 
     
     top = dump_xml(remote="/sdcard/st1.xml", local="/app/st1.xml")
     if is_command_pending(): 
         adb("input keyevent 4"); return {}
 
     adb("input swipe 333 948 333 316 450", 0.6)
+    time.sleep(1.0) # Stabilize scroll
     
     bot = dump_xml(remote="/sdcard/st2.xml", local="/app/st2.xml")
     
@@ -673,7 +678,8 @@ def main_loop():
         if PAGES_ENABLED["ac"] and mode != "IDLE":
              with SEQUENCE_LOCK:
                  if open_ac_page():
-                     time.sleep(1.5) # Allow page to load
+                     # FIX 3: Increased loading wait for AC page
+                     time.sleep(3.5) 
                      ac_xml = dump_xml("/sdcard/ac_full.xml", "/app/ac_full.xml")
                      if ac_xml:
                          ac_vals = extract_values_from_xml(ac_xml)

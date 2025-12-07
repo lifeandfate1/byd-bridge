@@ -10,6 +10,7 @@ Key improvements:
 - Change-only retained publishes; adaptive backoff on failures.
 - Strict env & *_FILE secret support.
 - DEBUG MODE: Saves XML snapshots for layout debugging.
+- SMART SCROLL: Detects if elements are hidden behind the bottom tab bar.
 """
 
 import os
@@ -27,7 +28,7 @@ from subprocess import Popen, PIPE, TimeoutExpired
 import re
 import xml.etree.ElementTree as ET
 
-# ---- BYD selectors (from older working code) ----
+# ---- BYD selectors (UPDATED based on debug XMLs) ----
 SEL = {
     # Home (read)
     "home_range": "com.byd.bydautolink:id/h_km_tv",
@@ -38,7 +39,8 @@ SEL = {
     "home_last_update": "com.byd.bydautolink:id/tv_update_time",
 
     # Home (tap targets)
-    "home_ac_row": "com.byd.bydautolink:id/c_air_item_rl_2",  # opens A/C page
+    # UPDATED: Old ID 'c_air_item_rl_2' did not exist. Using the inner temp ID as the tap target for A/C.
+    "home_ac_row": "com.byd.bydautolink:id/car_inner_temperature",
 
     # A/C page (read)
     "ac_setpoint": "com.byd.bydautolink:id/tem_tv",
@@ -53,7 +55,8 @@ SEL = {
     # Page nav by visible text (fallbacks)
     "nav_vehicle_status_text": "Vehicle status",
     "nav_vehicle_position_text": "Vehicle position",
-    "nav_ac_text": "A/C",
+    # UPDATED: Fallback text changed from 'A/C' to 'Cabin temperature'
+    "nav_ac_text": "Cabin temperature",
 }
 
 # ---- XML helpers ----
@@ -741,6 +744,24 @@ def _open_vehicle_status(adb: "ADB") -> bool:
         cands = _find_all_text_contains(root, SEL["nav_vehicle_status_text"])
         if cands:
             target = cands[0]
+            
+    # CHECK OBSTRUCTION: If target is too low, the bottom tab bar ('My car', 'My Account') covers it.
+    if target is not None:
+        c = _bounds(target)
+        if c and c[1] > 1320:  # Tab bar starts around 1356, give buffer
+            jslog("DBG", "target is low/obscured, scrolling up to reveal", y=c[1])
+            # Swipe up (finger moves up, content moves up)
+            # From center 360, Y=1200 -> Y=800
+            adb.shell("input swipe 360 1200 360 800 300")
+            time.sleep(1.0)
+            # Re-dump to get new coordinates
+            p = dump_xml(adb)
+            root = _parse_xml(p)
+            target = _find_text_equals(root, SEL["nav_vehicle_status_text"])
+            if target is None:
+                 cands = _find_all_text_contains(root, SEL["nav_vehicle_status_text"])
+                 target = cands[0] if cands else None
+
     if (target is not None) and _adb_tap_center_of(adb, target, label="Vehicle Status"):
         time.sleep(0.8)
         return True
@@ -750,7 +771,7 @@ def _open_ac_page(adb: "ADB") -> bool:
     # DEBUG SNAPSHOT 3
     save_debug_snapshot(adb, "03_before_ac_tap")
 
-    # Try by resource-id on home; fallback to text “A/C”
+    # Try by resource-id on home (now points to inner temp); fallback to text “Cabin temperature”
     p = dump_xml(adb)
     root = _parse_xml(p)
     target = _find_by_rid(root, SEL["home_ac_row"])
@@ -771,6 +792,21 @@ def _open_vehicle_position(adb: "ADB") -> bool:
     if target is None:
         c = _find_all_text_contains(root, SEL["nav_vehicle_position_text"])
         target = c[0] if c else None
+        
+    # CHECK OBSTRUCTION (Vehicle Position is usually safer, but good to be robust)
+    if target is not None:
+        c = _bounds(target)
+        if c and c[1] > 1320:
+            jslog("DBG", "target is low/obscured, scrolling up to reveal", y=c[1])
+            adb.shell("input swipe 360 1200 360 800 300")
+            time.sleep(1.0)
+            p = dump_xml(adb)
+            root = _parse_xml(p)
+            target = _find_text_equals(root, SEL["nav_vehicle_position_text"])
+            if target is None:
+                 cands = _find_all_text_contains(root, SEL["nav_vehicle_position_text"])
+                 target = cands[0] if cands else None
+
     if (target is not None) and _adb_tap_center_of(adb, target, label="Vehicle Position"):
         time.sleep(0.8)
         return True
@@ -783,19 +819,19 @@ def _open_vehicle_position(adb: "ADB") -> bool:
 def _scroll_down_once(adb: "ADB"):
     """
     Swipes up to scroll content down.
-    Adjust coordinates based on typical phone screen (approx 1080x2400).
-    Swipe from 500,1500 -> 500,500 (bottom to top).
+    Adjusted to safe screen coordinates.
+    Swipe from 360,1100 -> 360,500 (bottom to top).
     """
     jslog("DBG", "scrolling down once")
-    adb.shell("input swipe 500 1500 500 500 500")
+    adb.shell("input swipe 360 1100 360 500 500")
 
 def _scroll_to_top(adb: "ADB"):
     """
     Swipes down to scroll content to top.
-    Swipe from 500,500 -> 500,1500 (top to bottom).
+    Swipe from 360,500 -> 360,1100 (top to bottom).
     """
     jslog("DBG", "scrolling to top (reset)")
-    adb.shell("input swipe 500 500 500 1500 500")
+    adb.shell("input swipe 360 500 360 1100 500")
 
 def _is_home_page(root: ET.Element) -> bool:
     # Check if we see home elements

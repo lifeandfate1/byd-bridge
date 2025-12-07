@@ -845,35 +845,48 @@ def ensure_home_page_reset(adb: "ADB"):
     """
     jslog("DBG", "checking home page state")
 
-    # 1. Ensure app is in foreground (launch/resume)
-    # This fixes the issue where previous loops might have minimized it,
-    # or if the screen went to sleep/launcher.
+    # 1. Bring app to foreground (or launch it if closed)
+    # This is the "Safety Net": If the app crashed or was closed, this opens it back up.
     adb.shell("monkey -p com.byd.bydautolink -c android.intent.category.LAUNCHER 1")
-    time.sleep(1.5)
+    time.sleep(2.0)
     
-    # DEBUG SNAPSHOT 0
-    save_debug_snapshot(adb, "00_home_reset")
-    
+    # 2. Check if we are already on Home
     path = dump_xml(adb)
     root = _parse_xml(path)
     
-    # 2. If not on home page, try pressing BACK a few times
+    if _is_home_page(root):
+        # We are good! Just ensure we are scrolled to top.
+        _scroll_to_top(adb)
+        time.sleep(1.0) # Wait for scroll/bounce to settle
+        return
+
+    # 3. If we don't see Home elements, we might be in a sub-menu OR the app is loading.
+    # Let's wait and check ONE MORE TIME before pressing buttons.
+    jslog("INF", "home elements not found, waiting 2s to confirm...")
+    time.sleep(2.0)
+    path = dump_xml(adb)
+    root = _parse_xml(path)
+    
+    if _is_home_page(root):
+        _scroll_to_top(adb)
+        return
+
+    # 4. We are definitely not on home (or app is broken).
+    # Try backing out of sub-menus.
+    # Note: If we are actually on Home (but detection failed), this Back will close the app.
+    # That is okay! The NEXT loop will re-launch it via 'monkey' above.
     retries = 3
     while not _is_home_page(root) and retries > 0:
-        jslog("WRN", "not on home page, pressing BACK", retries=retries)
+        jslog("WRN", "not on home page, pressing BACK to exit sub-menu", retries=retries)
         adb.shell("input keyevent 4") # Key 4 is BACK
-        time.sleep(1.5)
+        time.sleep(2.0) # Give UI time to transition
         path = dump_xml(adb)
         root = _parse_xml(path)
         retries -= 1
 
-    # 3. Force scroll to top (resets position)
-    # This prevents the 'scroll down -> press back' bug in the next loop
+    # Final scroll check
     _scroll_to_top(adb)
-    
-    # CRITICAL FIX: Wait for "Pull to Refresh" animation
-    # If we are already at top, the swipe triggers a refresh spinner.
-    time.sleep(2.0)
+    time.sleep(1.0)
 
 # ---------- Tasks ----------
 

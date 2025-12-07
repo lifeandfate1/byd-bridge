@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 BYD Bridge — ADB-driven scraper + MQTT publisher for Home Assistant.
-(Fixed & Completed Version)
+(Refactored Architecture + Critical Fixes Only. No Adaptive Polling. No Self-Healing.)
 """
 
 import os
@@ -17,6 +17,10 @@ from datetime import datetime, timezone
 from subprocess import Popen, PIPE, TimeoutExpired
 import re
 import xml.etree.ElementTree as ET
+
+# ---- Global Locks ----
+ADB_LOCK = threading.RLock()
+SEQUENCE_LOCK = threading.RLock()
 
 # ---- BYD selectors ----
 SEL = {
@@ -52,7 +56,7 @@ SEL = {
     "nav_ac_text": "A/C",
 }
 
-# ---- PIN Coordinates (1080x2400 approx) ----
+# ---- PIN Coordinates ----
 PIN_TAPS = {
     "1": (170,  680), "2": (360,  680), "3": (550,  680),
     "4": (170,  870), "5": (360,  870), "6": (550,  870),
@@ -221,7 +225,7 @@ class ADB:
     def __init__(self, host: str, port: int, base_timeout: float = 8.0, max_retries: int = 3):
         self.host = host; self.port = port
         self.base_timeout = base_timeout; self.max_retries = max_retries
-        self.lock = threading.RLock()
+        self.lock = ADB_LOCK
 
     def _run(self, args: List[str], timeout: Optional[float]) -> Tuple[int, bytes, bytes]:
         cmd = ["adb", "-s", f"{self.host}:{self.port}"] + args
@@ -311,7 +315,7 @@ class MQTT:
 # ---------- Discovery ----------
 
 def device_info(cfg: Config) -> Dict[str, Any]:
-    return {"identifiers":[cfg.device_id], "manufacturer":"BYD", "name":cfg.device_name, "model":"BYD App Bridge", "sw_version":"2.0.0-refactor"}
+    return {"identifiers":[cfg.device_id], "manufacturer":"BYD", "name":cfg.device_name, "model":"BYD App Bridge", "sw_version":"2.0.0-fixed"}
 
 def disc_topic(cfg: Config, domain: str, object_id: str) -> str:
     return f"{cfg.discovery_prefix}/{domain}/{object_id}/config"
@@ -337,19 +341,76 @@ def publish_discovery(cfg: Config, mq: MQTT, caps: Dict[str, bool]):
         p.update(AV)
         mq.publish(disc_topic(cfg, "sensor", oid), json.dumps(p), retain=True, qos=1)
 
-    # Optional pages discovery omitted for brevity, mostly same as before
-    # [Insert similar logic for Vehicle Status / Position / AC entities here if needed]
-    # For now, relying on core + buttons working.
+    # Vehicle Status (conditional)
+    if caps.get("status"):
+        for oid, name, unit, icon, dclass in [
+            ("byd_odometer_km","Odometer","km","mdi:counter","distance"),
+            ("byd_driving_status","Driving Status",None,"mdi:car",None),
+            ("byd_whole_vehicle","Whole Vehicle Status",None,"mdi:car-connected",None),
+            ("byd_doors","Doors",None,"mdi:car-door",None),
+            ("byd_windows","Windows",None,"mdi:window-closed-variant",None),
+            ("byd_bonnet","Bonnet",None,"mdi:car",None),
+            ("byd_boot","Boot",None,"mdi:car-back",None),
+            ("byd_tyre_fl_psi","Tyre Front Left","psi","mdi:tire","pressure"),
+            ("byd_tyre_fr_psi","Tyre Front Right","psi","mdi:tire","pressure"),
+            ("byd_tyre_rl_psi","Tyre Rear Left","psi","mdi:tire","pressure"),
+            ("byd_tyre_rr_psi","Tyre Rear Right","psi","mdi:tire","pressure"),
+            ("byd_energy_recent_kwh_per_100km","Energy Recent","kWh/100km","mdi:lightning-bolt",None),
+            ("byd_energy_total_kwh_per_100km","Energy Total","kWh/100km","mdi:lightning-bolt-outline",None),
+        ]:
+            st = f"{cfg.topic_base}/{oid.replace('byd_','')}"
+            payload = {"uniq_id": f"{oid}_{cfg.device_id}", "name": name, "stat_t": st, "dev": dev}
+            if unit: payload["unit_of_measurement"] = unit
+            if icon: payload["icon"] = icon
+            if dclass: payload["device_class"] = dclass
+            payload.update(AV)
+            mq.publish(disc_topic(cfg, "sensor", oid), json.dumps(payload), retain=True, qos=1)
+
+    # Vehicle Position (conditional)
+    if caps.get("position"):
+        dt_oid = "byd_vehicle_tracker"
+        dt_payload = {
+            "uniq_id": f"{dt_oid}_{cfg.device_id}", "name": "BYD Vehicle", "dev": dev,
+            "json_attr_t": f"{cfg.topic_base}/location_json",
+            "state_topic": f"{cfg.topic_base}/vehicle_tracker_state",
+            "icon": "mdi:car-arrow-right",
+        }
+        dt_payload.update(AV)
+        mq.publish(disc_topic(cfg, "device_tracker", dt_oid), json.dumps(dt_payload), retain=True, qos=1)
+        for oid, name, key in [("byd_latitude","Latitude","latitude"),("byd_longitude","Longitude","longitude")]:
+            payload = {"uniq_id": f"{oid}_{cfg.device_id}", "name": name, "stat_t": f"{cfg.topic_base}/{key}", "dev": dev, "icon":"mdi:crosshairs-gps"}
+            payload.update(AV)
+            mq.publish(disc_topic(cfg, "sensor", oid), json.dumps(payload), retain=True, qos=1)
+
+    # A/C Page (conditional)
+    if caps.get("ac"):
+        for oid, name, unit in [
+            ("byd_climate_target_temp_c","Climate Target (°C)","°C"),
+            ("byd_climate_prev_temp_c","Climate Prev (°C)","°C"),
+            ("byd_climate_next_temp_c","Climate Next (°C)","°C"),
+        ]:
+            st = f"{cfg.topic_base}/{oid.replace('byd_','')}"
+            payload = {"uniq_id": f"{oid}_{cfg.device_id}", "name": name, "stat_t": st, "dev": dev, "unit_of_measurement": unit, "icon":"mdi:thermometer"}
+            payload.update(AV)
+            mq.publish(disc_topic(cfg, "sensor", oid), json.dumps(payload), retain=True, qos=1)
+        payload = {"uniq_id":f"byd_climate_power_{cfg.device_id}","name":"Climate Power","stat_t":f"{cfg.topic_base}/climate_power","dev":dev,"icon":"mdi:power"}
+        payload.update(AV)
+        mq.publish(disc_topic(cfg, "sensor","byd_climate_power"), json.dumps(payload), retain=True, qos=1)
+        for oid, name, cmd in [
+            ("byd_ac_up_btn","A/C Temp Up","ac_up"),
+            ("byd_ac_down_btn","A/C Temp Down","ac_down"),
+            ("byd_climate_rapid_heat","Climate Rapid Heat","climate_rapid_heat"),
+            ("byd_climate_rapid_vent","Climate Rapid Vent","climate_rapid_vent"),
+            ("byd_climate_switch_on","Climate Power Toggle","climate_switch_on"),
+        ]:
+            payload = {"uniq_id": f"{oid}_{cfg.device_id}", "name": name, "dev": dev, "cmd_t": f"{cfg.topic_base}/cmd/{cmd}"}
+            payload.update(AV)
+            mq.publish(disc_topic(cfg, "button", oid), json.dumps(payload), retain=True, qos=1)
 
     # Buttons
     cmds = [
         ("byd_cmd_unlock", "Unlock", "unlock", "mdi:lock-open-variant"),
         ("byd_cmd_lock", "Lock", "lock", "mdi:lock"),
-        ("byd_cmd_ac_up", "A/C Temp Up", "ac_up", "mdi:thermometer-plus"),
-        ("byd_cmd_ac_down", "A/C Temp Down", "ac_down", "mdi:thermometer-minus"),
-        ("byd_cmd_ac_on", "A/C Switch On", "climate_switch_on", "mdi:power"),
-        ("byd_cmd_heat", "Rapid Heat", "climate_rapid_heat", "mdi:fire"),
-        ("byd_cmd_cool", "Rapid Cool", "climate_rapid_vent", "mdi:fan"),
     ]
     for oid, name, cmd_slug, icon in cmds:
         p = {"uniq_id": f"{oid}_{cfg.device_id}", "name": name, "dev": dev, "cmd_t": f"{cfg.topic_base}/cmd/{cmd_slug}", "icon": icon}
@@ -366,36 +427,135 @@ def _looks_like_xml(buf: bytes) -> bool:
     return b.startswith(b"<?xml")
 
 def dump_xml(adb: ADB) -> str:
-    # ... (Keep existing robust dump logic from your pasted file) ...
-    # Simplified for brevity here, assuming the logic in your paste was good
-    dump_out = adb.shell("uiautomator dump", timeout=10.0)
-    m = re.search(r"(/sdcard/\S+\.xml)", dump_out or "")
-    dump_path = m.group(1) if m else "/sdcard/window_dump.xml"
-    out = adb.exec_out(["cat", dump_path], timeout=6.0)
-    
-    if not _looks_like_xml(out):
-        # Fallback
-        out = adb.shell(f"cat {dump_path}", timeout=6.0).encode("utf-8","ignore")
-    
-    with open(XML_TMP, "wb") as fh: fh.write(out)
-    return XML_TMP
+    # 1. Attempt Dump
+    try:
+        dump_out = adb.shell("uiautomator dump", timeout=12.0)
+        m = re.search(r"(/sdcard/\S+\.xml)", dump_out or "")
+        dump_path = m.group(1) if m else "/sdcard/window_dump.xml"
+        
+        # 2. Retrieve Content
+        out = adb.exec_out(["cat", dump_path], timeout=8.0)
+        if not _looks_like_xml(out):
+            out = adb.shell(f"cat {dump_path}", timeout=8.0).encode("utf-8","ignore")
+        
+        # 3. Write & Validate
+        with open(XML_TMP, "wb") as fh: fh.write(out)
+        return XML_TMP
 
-# --- Page Parsers (Keep existing from your paste) ---
+    except Exception as e:
+        _StatusHandler.METRICS["dumps_failed_total"] += 1
+        jslog("WRN", "UI Dump failed", error=str(e))
+        return XML_TMP
+
+# --- Page Parsers ---
 def parse_home_xml(path: str) -> Dict[str, Any]:
-    root = _parse_xml(path)
-    out = {}
-    # ... (Same logic as your paste) ...
-    if (n := _find_by_rid(root, SEL["home_range"])): 
+    try:
+        root = _parse_xml(path)
+    except Exception: return {}
+    
+    out: Dict[str, Any] = {}
+    if (n := _find_by_rid(root, SEL["home_soc"])) is not None:
+        m = re.search(r"(\d+)", _txt(n))
+        if m: out["battery_soc"] = int(m.group(1))
+    if (n := _find_by_rid(root, SEL["home_range"])) is not None:
         m = re.search(r"(\d+)", _txt(n))
         if m: out["range_km"] = int(m.group(1))
-    if (n := _find_by_rid(root, SEL["home_soc"])): 
-        out["battery_soc"] = _txt(n).replace("%","")
-    # ... etc ...
+    if (n := _find_by_rid(root, SEL["home_cabin_temp"])) is not None:
+        m = re.search(r"(-?\d+(?:\.\d+)?)", _txt(n))
+        if m: out["cabin_temp_c"] = float(m.group(1))
+    if (n := _find_by_rid(root, SEL["home_setpoint"])) is not None:
+        m = re.search(r"(-?\d+(?:\.\d+)?)", _txt(n))
+        if m: out["climate_target_temp_c"] = float(m.group(1))
+    if (n := _find_by_rid(root, SEL["home_car_status"])) is not None:
+        out["car_status"] = _txt(n)
+    if (n := _find_by_rid(root, SEL["home_last_update"])) is not None:
+        out["last_update"] = _txt(n)
     return out
 
-# --- Nav Helpers (FIXED) ---
+def parse_status_xmls(top_path: str, bottom_path: str) -> Dict[str, Any]:
+    try:
+        root = _parse_xml(top_path)
+    except Exception: return {}
+    
+    text_nodes = [(_txt(n), n) for n in _all_nodes(root) if _txt(n)]
+    out: Dict[str, Any] = {}
+
+    tyre_vals = []
+    for t, n in text_nodes:
+        m = re.search(r"(\d+\.\d)\s*psi", t, re.I)
+        if m: tyre_vals.append(float(m.group(1)))
+    if len(tyre_vals) >= 4:
+        out["tyre_fl_psi"], out["tyre_fr_psi"], out["tyre_rl_psi"], out["tyre_rr_psi"] = tyre_vals[:4]
+
+    for t, _ in text_nodes:
+        m = re.search(r"(\d{1,7})\s*km\b", t, re.I)
+        if m: out["odometer_km"] = int(m.group(1)); break
+
+    for t, _ in text_nodes:
+        m = re.search(r"(\d+(?:\.\d+)?)\s*kW.?h/100km", t)
+        if m and "energy_recent_kwh_per_100km" not in out:
+            out["energy_recent_kwh_per_100km"] = float(m.group(1))
+        elif m:
+            out["energy_total_kwh_per_100km"] = float(m.group(1))
+
+    def _label_value(label: str, key: str):
+        n = _find_text_equals(root, label)
+        if n is None: return
+        after = []
+        found = False
+        for el in _all_nodes(root):
+            if el is n: found = True; continue
+            if found and _txt(el):
+                after.append(_txt(el))
+                if len(after) >= 1: break
+        if after: out[key] = after[0]
+
+    _label_value("Front bonnet", "bonnet")
+    _label_value("Doors", "doors")
+    _label_value("Windows", "windows")
+    _label_value("Boot", "boot")
+    _label_value("Whole Vehicle Status", "whole_vehicle")
+    _label_value("Driving status", "driving_status")
+    return out
+
+def parse_ac_xml(path: str) -> Dict[str, Any]:
+    try:
+        root = _parse_xml(path)
+    except Exception: return {}
+    
+    out: Dict[str, Any] = {}
+    if (n := _find_by_rid(root, SEL["ac_setpoint"])) is not None:
+        m = re.search(r"(-?\d+(?:\.\d+)?)", _txt(n))
+        if m: out["climate_target_temp_c"] = float(m.group(1))
+    if (n := _find_by_rid(root, SEL["ac_prev"])) is not None:
+        m = re.search(r"(-?\d+(?:\.\d+)?)", _txt(n))
+        if m: out["climate_prev_temp_c"] = float(m.group(1))
+    if (n := _find_by_rid(root, SEL["ac_next"])) is not None:
+        m = re.search(r"(-?\d+(?:\.\d+)?)", _txt(n))
+        if m: out["climate_next_temp_c"] = float(m.group(1))
+    btn = _find_by_rid(root, SEL["ac_power_btn"])
+    if btn:
+        texts = [ _txt(n) for n in btn.iter() if _txt(n) ]
+        if any("Switch on" in t for t in texts): out["climate_power"] = "off"
+        elif any("Switch off" in t for t in texts): out["climate_power"] = "on"
+    return out
+
+def parse_position_xml(path: str) -> Dict[str, Any]:
+    try:
+        root = _parse_xml(path)
+    except Exception: return {}
+    
+    latlon = None
+    for n in _all_nodes(root):
+        t = _txt(n)
+        m = re.search(r"(-?\d{1,3}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)", t)
+        if m: latlon = (float(m.group(1)), float(m.group(2))); break
+    if latlon:
+        return {"latitude": latlon[0], "longitude": latlon[1], "gps_accuracy": 10}
+    return {}
+
+# --- Nav Helpers ---
 def _go_home(adb: ADB):
-    # Dumb but effective: press back a few times
     adb.shell("input keyevent 4", timeout=1)
     time.sleep(0.5)
     adb.shell("input keyevent 4", timeout=1)
@@ -406,90 +566,175 @@ def _scroll_down_once(adb: ADB):
 
 def _ensure_pin(adb: ADB, pin: str):
     if not pin: return
-    # Check if PIN screen is up? (Skip check for speed, just tap blindly or check dump)
-    # Tapping the input area just in case
     adb.shell("input tap 360 1245", timeout=1.0)
     for digit in pin:
         x, y = PIN_TAPS.get(digit, (0,0))
         if x: adb.shell(f"input tap {x} {y}", timeout=0.5)
     time.sleep(1.0)
 
-# --- Actions ---
+def _open_vehicle_status(adb: "ADB") -> bool:
+    p = dump_xml(adb)
+    try: root = _parse_xml(p)
+    except: return False
+    
+    target = _find_text_equals(root, SEL["nav_vehicle_status_text"])
+    if target is None:
+        cands = _find_all_text_contains(root, SEL["nav_vehicle_status_text"])
+        if cands: target = cands[0]
+    if (target is not None) and _adb_tap_center_of(adb, target):
+        time.sleep(3.5) # Wait for load (Fixed from 0.8)
+        return True
+    return False
+
+def _open_ac_page(adb: "ADB") -> bool:
+    p = dump_xml(adb)
+    try: root = _parse_xml(p)
+    except: return False
+    
+    target = _find_by_rid(root, SEL["home_ac_row"])
+    if target is None: target = _find_text_equals(root, SEL["nav_ac_text"])
+    if (target is not None) and _adb_tap_center_of(adb, target):
+        time.sleep(3.5) # Wait for load (Fixed from 0.6)
+        return True
+    return False
+
+def _open_vehicle_position(adb: "ADB") -> bool:
+    p = dump_xml(adb)
+    try: root = _parse_xml(p)
+    except: return False
+    
+    target = _find_text_equals(root, SEL["nav_vehicle_position_text"])
+    if target is None:
+        c = _find_all_text_contains(root, SEL["nav_vehicle_position_text"])
+        target = c[0] if c else None
+    if (target is not None) and _adb_tap_center_of(adb, target):
+        time.sleep(0.8)
+        return True
+    return False
+
+# --- Actions (Fixed) ---
 def execute_command(cfg: Config, adb: ADB, action: str):
+    # RESTORED: Sequence lock is acquired in CommandWorker before calling this
     jslog("INF", "executing command", action=action)
     _go_home(adb)
     
     if action == "unlock":
-        # Need to find quick control row
-        p = dump_xml(adb); root = _parse_xml(p)
-        # Find all tiles
+        p = dump_xml(adb); 
+        try: root = _parse_xml(p)
+        except: return
         tiles = []
         for n in _all_nodes(root):
-            if _rid(n) == SEL["quick_control_row"]:
-                tiles.append(_bounds(n))
-        tiles = sorted([t for t in tiles if t], key=lambda x: x[0]) # Sort Left->Right
+            if _rid(n) == SEL["quick_control_row"]: tiles.append(_bounds(n))
+        tiles = sorted([t for t in tiles if t], key=lambda x: x[0]) 
         if tiles:
-            x,y = tiles[0] # First tile is Unlock
+            x,y = tiles[0]
             adb.shell(f"input tap {x} {y}")
             _ensure_pin(adb, cfg.byd_pin)
 
     elif action == "lock":
-        # Similar logic, 2nd tile
-        p = dump_xml(adb); root = _parse_xml(p)
+        p = dump_xml(adb); 
+        try: root = _parse_xml(p)
+        except: return
         tiles = []
         for n in _all_nodes(root):
-            if _rid(n) == SEL["quick_control_row"]:
-                tiles.append(_bounds(n))
+            if _rid(n) == SEL["quick_control_row"]: tiles.append(_bounds(n))
         tiles = sorted([t for t in tiles if t], key=lambda x: x[0])
         if len(tiles) > 1:
-            x,y = tiles[1] # Second tile
+            x,y = tiles[1]
             adb.shell(f"input tap {x} {y}")
             _ensure_pin(adb, cfg.byd_pin)
 
     elif action in ("ac_up", "ac_down"):
-        # On home screen
         rid = SEL["temp_up"] if action == "ac_up" else SEL["temp_down"]
-        p = dump_xml(adb); root = _parse_xml(p)
-        if (n := _find_by_rid(root, rid)):
-            _adb_tap_center_of(adb, n)
+        p = dump_xml(adb); 
+        try: root = _parse_xml(p)
+        except: return
+        if (n := _find_by_rid(root, rid)): _adb_tap_center_of(adb, n)
 
     elif action in ("climate_switch_on", "climate_rapid_heat", "climate_rapid_vent"):
-        # Need to open AC page first
-        p = dump_xml(adb); root = _parse_xml(p)
-        # Tap AC row
-        target = _find_by_rid(root, SEL["home_ac_row"])
-        if target and _adb_tap_center_of(adb, target):
-            time.sleep(2.5) # Wait for load
-            # Tap specific button
-            p2 = dump_xml(adb); root2 = _parse_xml(p2)
-            if action == "climate_switch_on":
-                tgt = _find_by_rid(root2, SEL["ac_power_btn"])
-            elif action == "climate_rapid_heat":
-                tgt = _find_by_rid(root2, SEL["ac_heat_btn"])
-            else:
-                tgt = _find_by_rid(root2, SEL["ac_cool_btn"])
+        if _open_ac_page(adb):
+            p2 = dump_xml(adb); 
+            try: root2 = _parse_xml(p2)
+            except: return
+            
+            if action == "climate_switch_on": tgt = _find_by_rid(root2, SEL["ac_power_btn"])
+            elif action == "climate_rapid_heat": tgt = _find_by_rid(root2, SEL["ac_heat_btn"])
+            else: tgt = _find_by_rid(root2, SEL["ac_cool_btn"])
             
             if tgt:
                 _adb_tap_center_of(adb, tgt)
                 _ensure_pin(adb, cfg.byd_pin)
-            
-            # Back to home
             adb.shell("input keyevent 4")
 
-# ---------- Tasks (Cleaned) ----------
+# ---------- Tasks ----------
 
 def task_home(cfg: Config, adb: ADB, mq: MQTT):
-    path = dump_xml(adb)
-    vals = parse_home_xml(path)
-    if vals:
-        for k, v in vals.items():
-            mq.publish(f"{cfg.topic_base}/{k}", str(v), retain=True)
+    # RESTORED: Sequence Lock
+    with SEQUENCE_LOCK:
+        path = dump_xml(adb)
+        vals = parse_home_xml(path)
+        if not vals:
+            jslog("WRN", "home XML yielded no values; skipping publish")
+            return
+        for key, value in vals.items():
+            mq.publish(f"{cfg.topic_base}/{key}", json.dumps(value) if isinstance(value, (dict,list)) else str(value), retain=True, qos=1)
 
 def task_vehicle_status(cfg: Config, adb: ADB, mq: MQTT):
-    # Open page logic...
-    pass # (Use the logic from your paste, but with _scroll_down_once defined now)
+    # RESTORED: Sequence Lock
+    with SEQUENCE_LOCK:
+        if not _open_vehicle_status(adb):
+            jslog("WRN", "could not open Vehicle status page; skipping")
+            return
 
-# ---------- Main ----------
+        # Top half
+        top = dump_xml(adb)
+        vals_top = parse_status_xmls(top, top)
+
+        # Scroll (Fixed: calling the helper)
+        _scroll_down_once(adb)
+        time.sleep(1.0) # Wait for scroll to settle
+
+        # Bottom half
+        bottom = dump_xml(adb)
+        vals_bottom = parse_status_xmls(bottom, bottom)
+
+        vals = {**vals_top, **vals_bottom}
+        if not vals:
+            jslog("WRN", "status XML yielded no values; skipping")
+        else:
+            for key, value in vals.items():
+                mq.publish(f"{cfg.topic_base}/{key}", str(value), retain=True, qos=1)
+
+        adb.shell("input keyevent 4", timeout=2.0)
+
+def task_vehicle_position(cfg: Config, adb: ADB, mq: MQTT):
+    # RESTORED: Sequence Lock
+    with SEQUENCE_LOCK:
+        if not _open_vehicle_position(adb):
+            jslog("WRN", "could not open Vehicle position page; skipping")
+            return
+        path = dump_xml(adb)
+        vals = parse_position_xml(path)
+        if "latitude" in vals:
+            mq.publish(f"{cfg.topic_base}/latitude", str(vals["latitude"]), retain=True, qos=1)
+            mq.publish(f"{cfg.topic_base}/longitude", str(vals["longitude"]), retain=True, qos=1)
+            mq.publish(f"{cfg.topic_base}/location_json", json.dumps(vals), retain=True, qos=1)
+        adb.shell("input keyevent 4", timeout=2.0)
+
+def task_ac_page(cfg: Config, adb: ADB, mq: MQTT):
+    # RESTORED: Sequence Lock
+    with SEQUENCE_LOCK:
+        if not _open_ac_page(adb):
+            jslog("WRN", "could not open A/C page; skipping")
+            return
+        path = dump_xml(adb)
+        vals = parse_ac_xml(path)
+        if vals:
+            for key, value in vals.items():
+                mq.publish(f"{cfg.topic_base}/{key}", str(value), retain=True, qos=1)
+        adb.shell("input keyevent 4", timeout=2.0)
+
+# ---------- Main loop ----------
 
 class CommandWorker:
     def __init__(self, cfg: Config, adb: ADB):
@@ -506,37 +751,65 @@ class CommandWorker:
         while True:
             action = self.q.get()
             try:
-                execute_command(self.cfg, self.adb, action)
+                # RESTORED: Sequence Lock prevents interruption of scrapes
+                with SEQUENCE_LOCK:
+                    execute_command(self.cfg, self.adb, action)
             except Exception as e:
                 jslog("ERR", "command failed", action=action, error=str(e))
             self.q.task_done()
 
+def build_caps(cfg: Config) -> Dict[str, bool]:
+    return {"home": True, "status": cfg.enable_vehicle_status, "position": cfg.enable_vehicle_position, "ac": cfg.enable_ac_page}
+
+def build_tasks(cfg: Config) -> List[Callable[[Config, ADB, MQTT], None]]:
+    tasks = [task_home]
+    if cfg.enable_vehicle_status: tasks.append(task_vehicle_status)
+    if cfg.enable_vehicle_position: tasks.append(task_vehicle_position)
+    if cfg.enable_ac_page: tasks.append(task_ac_page)
+    return tasks
+
 def main():
     cfg = load_config()
-    mq = MQTT(cfg); mq.connect()
-    adb = ADB(cfg.phone_ip, cfg.adb_port)
-    
-    # Initialize caps and discovery...
-    caps = {"home": True, "status": cfg.enable_vehicle_status, "position": cfg.enable_vehicle_position, "ac": cfg.enable_ac_page}
-    publish_discovery(cfg, mq, caps)
+    jslog("INF", "boot", modules={"vehicle_status":cfg.enable_vehicle_status,"vehicle_position":cfg.enable_vehicle_position,"ac_page":cfg.enable_ac_page})
 
-    worker = CommandWorker(cfg, adb)
+    maybe_start_status_server(cfg.http_status_port)
+
+    mq = MQTT(cfg); mq.connect()
+
+    adb = ADB(cfg.phone_ip, cfg.adb_port)
+    try: adb.shell("echo warmup >/dev/null", timeout=2.0)
+    except Exception as e: jslog("WRN", "adb warmup failed", error=str(e))
+
+    caps = build_caps(cfg); publish_discovery(cfg, mq, caps)
+
+    global worker; worker = CommandWorker(cfg, adb)
 
     def on_mqtt_cmd(topic, payload):
-        action = topic.split("/")[-1] # simple parse
+        action = topic.split("/cmd/")[-1]
         worker.submit(action)
-
     mq.subscribe_handler(f"{cfg.topic_base}/cmd/#", on_mqtt_cmd)
 
-    # Main Loop
+    tasks = build_tasks(cfg)
+    consecutive_failures = 0
+    
+    # Simple Loop: No Adaptive Polling
     while True:
+        _StatusHandler.METRICS["poll_cycles_total"] += 1
+        t0 = time.time()
         try:
-            task_home(cfg, adb, mq)
-            # Add other tasks...
+            for t in tasks: t(cfg, adb, mq)
+            consecutive_failures = 0
+            _StatusHandler.LAST_HEALTH["last_ok"] = datetime.now(timezone.utc).isoformat()
         except Exception as e:
-            jslog("ERR", "loop error", error=str(e))
+            _StatusHandler.METRICS["poll_failures_total"] += 1
+            consecutive_failures += 1
+            jslog("ERR", "poll iteration failed", error=str(e), failures=consecutive_failures)
         
-        time.sleep(cfg.poll_seconds)
+        # Simple sleep logic
+        delay = cfg.poll_seconds
+        elapsed = time.time()-t0
+        time.sleep(max(0.0, delay - elapsed))
 
 if __name__ == "__main__":
-    main()
+    try: main()
+    except KeyboardInterrupt: jslog("INF","shutdown requested")

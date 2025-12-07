@@ -840,10 +840,16 @@ def _is_home_page(root: ET.Element) -> bool:
 
 def ensure_home_page_reset(adb: "ADB"):
     """
-    Ensures we are on the Home Page and scrolled to the top.
-    Checks for a known home element (like range or soc).
+    Ensures the BYD app is in foreground and on Home Page (scrolled to top).
+    Uses 'monkey' to launch/switch to app, then BACK if needed.
     """
     jslog("DBG", "checking home page state")
+
+    # 1. Ensure app is in foreground (launch/resume)
+    # This fixes the issue where previous loops might have minimized it,
+    # or if the screen went to sleep/launcher.
+    adb.shell("monkey -p com.byd.bydautolink -c android.intent.category.LAUNCHER 1")
+    time.sleep(1.5)
     
     # DEBUG SNAPSHOT 0
     save_debug_snapshot(adb, "00_home_reset")
@@ -851,21 +857,22 @@ def ensure_home_page_reset(adb: "ADB"):
     path = dump_xml(adb)
     root = _parse_xml(path)
     
-    if not _is_home_page(root):
-        jslog("WRN", "not on home page, pressing HOME button")
-        adb.shell("input keyevent 3") # Key 3 is HOME
-        time.sleep(1.0)
-        # Try one more back just in case (to close overlays)
-        # adb.shell("input keyevent 4")
-        # time.sleep(0.5)
+    # 2. If not on home page, try pressing BACK a few times
+    retries = 3
+    while not _is_home_page(root) and retries > 0:
+        jslog("WRN", "not on home page, pressing BACK", retries=retries)
+        adb.shell("input keyevent 4") # Key 4 is BACK
+        time.sleep(1.5)
+        path = dump_xml(adb)
+        root = _parse_xml(path)
+        retries -= 1
 
-    # Force scroll to top to reset any previous scrolling state
+    # 3. Force scroll to top (resets position)
     # This prevents the 'scroll down -> press back' bug in the next loop
     _scroll_to_top(adb)
     
     # CRITICAL FIX: Wait for "Pull to Refresh" animation
     # If we are already at top, the swipe triggers a refresh spinner.
-    # Tapping during the spinner is ignored by the OS.
     time.sleep(2.0)
 
 # ---------- Tasks ----------
@@ -937,7 +944,10 @@ def task_vehicle_position(cfg: Config, adb: ADB, mq: MQTT):
     if not _open_vehicle_position(adb):
         jslog("WRN", "could not open Vehicle position page; skipping")
         return
-    time.sleep(0.5)
+    
+    # Give map/text time to load (was 0.5s, likely too fast)
+    time.sleep(2.5)
+    
     path = dump_xml(adb)
     
     # CRITICAL CHECK: Did we actually leave the home page?

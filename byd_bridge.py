@@ -9,6 +9,7 @@ Key improvements:
 - HA Discovery with module flags for Vehicle Status, Position, A/C.
 - Change-only retained publishes; adaptive backoff on failures.
 - Strict env & *_FILE secret support.
+- DEBUG MODE: Saves XML snapshots for layout debugging.
 """
 
 import os
@@ -18,6 +19,7 @@ import queue
 import threading
 import http.server
 import socketserver
+import shutil  # Added for debug file operations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Callable, Tuple
 from datetime import datetime, timezone
@@ -93,11 +95,13 @@ def _find_text_equals(root: ET.Element, s: str):
             return n
     return None
 
-def _adb_tap_center_of(adb: "ADB", node: ET.Element) -> bool:
+def _adb_tap_center_of(adb: "ADB", node: ET.Element, label: str = "unknown") -> bool:
     c = _bounds(node)
     if not c:
+        jslog("WRN", f"found node for '{label}' but could not parse bounds")
         return False
     x, y = c
+    jslog("DBG", f"tapping '{label}'", x=x, y=y)
     adb.shell(f"input tap {x} {y}", timeout=2.0)
     return True
 
@@ -572,6 +576,19 @@ def dump_xml(adb: ADB) -> str:
         fh.write(data)
     return target
 
+def save_debug_snapshot(adb: ADB, label: str):
+    """Save a snapshot of the current XML for debugging."""
+    try:
+        # Just re-use the file that dump_xml just wrote to XML_TMP
+        # But we need to make sure dump_xml was called recently or call it now.
+        # Ideally we call dump_xml, then copy it.
+        src = dump_xml(adb)
+        dst = f"/tmp/debug_{label}.xml"
+        shutil.copy(src, dst)
+        jslog("DBG", "saved debug snapshot", path=dst)
+    except Exception as e:
+        jslog("WRN", "failed to save debug snapshot", error=str(e))
+
 def parse_home_xml(path: str) -> Dict[str, Any]:
     root = _parse_xml(path)
     out: Dict[str, Any] = {}
@@ -712,6 +729,9 @@ def parse_position_xml(path: str) -> Dict[str, Any]:
     return {}
 
 def _open_vehicle_status(adb: "ADB") -> bool:
+    # DEBUG SNAPSHOT 1
+    save_debug_snapshot(adb, "01_before_status_tap")
+    
     # Start from wherever we are: dump once, try to tap the “Vehicle status” card/label
     p = dump_xml(adb)
     root = _parse_xml(p)
@@ -721,31 +741,37 @@ def _open_vehicle_status(adb: "ADB") -> bool:
         cands = _find_all_text_contains(root, SEL["nav_vehicle_status_text"])
         if cands:
             target = cands[0]
-    if (target is not None) and _adb_tap_center_of(adb, target):
+    if (target is not None) and _adb_tap_center_of(adb, target, label="Vehicle Status"):
         time.sleep(0.8)
         return True
     return False
 
 def _open_ac_page(adb: "ADB") -> bool:
+    # DEBUG SNAPSHOT 3
+    save_debug_snapshot(adb, "03_before_ac_tap")
+
     # Try by resource-id on home; fallback to text “A/C”
     p = dump_xml(adb)
     root = _parse_xml(p)
     target = _find_by_rid(root, SEL["home_ac_row"])
     if target is None:
         target = _find_text_equals(root, SEL["nav_ac_text"])
-    if (target is not None) and _adb_tap_center_of(adb, target):
+    if (target is not None) and _adb_tap_center_of(adb, target, label="AC Page"):
         time.sleep(0.6)
         return True
     return False
 
 def _open_vehicle_position(adb: "ADB") -> bool:
+    # DEBUG SNAPSHOT 2
+    save_debug_snapshot(adb, "02_before_position_tap")
+    
     p = dump_xml(adb)
     root = _parse_xml(p)
     target = _find_text_equals(root, SEL["nav_vehicle_position_text"])
     if target is None:
         c = _find_all_text_contains(root, SEL["nav_vehicle_position_text"])
         target = c[0] if c else None
-    if (target is not None) and _adb_tap_center_of(adb, target):
+    if (target is not None) and _adb_tap_center_of(adb, target, label="Vehicle Position"):
         time.sleep(0.8)
         return True
     return False
@@ -782,6 +808,10 @@ def ensure_home_page_reset(adb: "ADB"):
     Checks for a known home element (like range or soc).
     """
     jslog("DBG", "checking home page state")
+    
+    # DEBUG SNAPSHOT 0
+    save_debug_snapshot(adb, "00_home_reset")
+    
     path = dump_xml(adb)
     root = _parse_xml(path)
     

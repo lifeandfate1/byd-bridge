@@ -771,6 +771,11 @@ def _scroll_to_top(adb: "ADB"):
     jslog("DBG", "scrolling to top (reset)")
     adb.shell("input swipe 500 500 500 1500 500")
 
+def _is_home_page(root: ET.Element) -> bool:
+    # Check if we see home elements
+    return (_find_by_rid(root, SEL["home_range"]) is not None) or \
+           (_find_by_rid(root, SEL["home_soc"]) is not None)
+
 def ensure_home_page_reset(adb: "ADB"):
     """
     Ensures we are on the Home Page and scrolled to the top.
@@ -780,11 +785,7 @@ def ensure_home_page_reset(adb: "ADB"):
     path = dump_xml(adb)
     root = _parse_xml(path)
     
-    # Check if we see home elements
-    is_home = (_find_by_rid(root, SEL["home_range"]) is not None) or \
-              (_find_by_rid(root, SEL["home_soc"]) is not None)
-    
-    if not is_home:
+    if not _is_home_page(root):
         jslog("WRN", "not on home page, pressing HOME button")
         adb.shell("input keyevent 3") # Key 3 is HOME
         time.sleep(1.0)
@@ -795,7 +796,11 @@ def ensure_home_page_reset(adb: "ADB"):
     # Force scroll to top to reset any previous scrolling state
     # This prevents the 'scroll down -> press back' bug in the next loop
     _scroll_to_top(adb)
-    time.sleep(0.5)
+    
+    # CRITICAL FIX: Wait for "Pull to Refresh" animation
+    # If we are already at top, the swipe triggers a refresh spinner.
+    # Tapping during the spinner is ignored by the OS.
+    time.sleep(2.0)
 
 # ---------- Tasks ----------
 
@@ -821,6 +826,14 @@ def task_vehicle_status(cfg: Config, adb: ADB, mq: MQTT):
 
     # Top half scrape
     top = dump_xml(adb)
+    
+    # CRITICAL CHECK: Did we actually leave the home page?
+    # If the tap was eaten by the refresh spinner, we are still on home.
+    # If we proceed, we will fail to find status data and press BACK (closing the app).
+    if _is_home_page(_parse_xml(top)):
+        jslog("WRN", "tap to Vehicle Status failed (still on home); skipping without back")
+        return
+
     vals_top = parse_status_xmls(top, top)
 
     # Scroll down to reveal bottom elements
@@ -860,6 +873,12 @@ def task_vehicle_position(cfg: Config, adb: ADB, mq: MQTT):
         return
     time.sleep(0.5)
     path = dump_xml(adb)
+    
+    # CRITICAL CHECK: Did we actually leave the home page?
+    if _is_home_page(_parse_xml(path)):
+        jslog("WRN", "tap to Vehicle Position failed (still on home); skipping without back")
+        return
+
     vals = parse_position_xml(path)
     if "latitude" in vals and "longitude" in vals:
         mq.publish(f"{cfg.topic_base}/latitude", str(vals["latitude"]), retain=True, qos=1)   # (Optional) qos=1
@@ -879,6 +898,12 @@ def task_ac_page(cfg: Config, adb: ADB, mq: MQTT):
         return
     time.sleep(0.4)
     path = dump_xml(adb)
+    
+    # CRITICAL CHECK: Did we actually leave the home page?
+    if _is_home_page(_parse_xml(path)):
+        jslog("WRN", "tap to AC Page failed (still on home); skipping without back")
+        return
+
     vals = parse_ac_xml(path)
     if not vals:
         jslog("WRN", "A/C XML yielded no values; skipping publish")

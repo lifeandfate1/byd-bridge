@@ -534,7 +534,7 @@ def parse_ac_xml(path: str) -> Dict[str, Any]:
         m = re.search(r"(-?\d+(?:\.\d+)?)", _txt(n))
         if m: out["climate_next_temp_c"] = float(m.group(1))
     btn = _find_by_rid(root, SEL["ac_power_btn"])
-    if btn:
+    if btn is not None: # FIX: Explicit boolean check to silence warning
         texts = [ _txt(n) for n in btn.iter() if _txt(n) ]
         if any("Switch on" in t for t in texts): out["climate_power"] = "off"
         elif any("Switch off" in t for t in texts): out["climate_power"] = "on"
@@ -649,7 +649,8 @@ def execute_command(cfg: Config, adb: ADB, action: str):
         p = dump_xml(adb); 
         try: root = _parse_xml(p)
         except: return
-        if (n := _find_by_rid(root, rid)): _adb_tap_center_of(adb, n)
+        # FIX: Explicit boolean check to silence warning
+        if (n := _find_by_rid(root, rid)) is not None: _adb_tap_center_of(adb, n)
 
     elif action in ("climate_switch_on", "climate_rapid_heat", "climate_rapid_vent"):
         if _open_ac_page(adb):
@@ -661,7 +662,8 @@ def execute_command(cfg: Config, adb: ADB, action: str):
             elif action == "climate_rapid_heat": tgt = _find_by_rid(root2, SEL["ac_heat_btn"])
             else: tgt = _find_by_rid(root2, SEL["ac_cool_btn"])
             
-            if tgt:
+            # FIX: Explicit boolean check to silence warning
+            if tgt is not None:
                 _adb_tap_center_of(adb, tgt)
                 _ensure_pin(adb, cfg.byd_pin)
             adb.shell("input keyevent 4")

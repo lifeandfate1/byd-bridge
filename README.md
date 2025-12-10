@@ -14,12 +14,9 @@ The Python script does not handle the connection; it assumes the environment has
 
 * **⚡ Adaptive Polling Engine:**
     * **Driving:** Polls every **60s** (configurable).
-    * **Charging:** Detects charging state (via UI text) and speeds up to **30s**.
-    * **Idle:** Slows down to **10 mins** if parked for >15 mins to save battery.
     * **Instant Wake:** Command queue interrupts polling immediately to execute actions (e.g., Unlock).
 
 * **🛡️ Robustness:**
-    * **Self-Healing:** If the UI dump fails 3 times (ADB instability), it performs a `force-stop` and restarts the BYD app automatically.
     * **Ghosting Protection:** Filters out placeholder values (`--`, `---`) so Home Assistant history remains clean.
     * **Race Condition Locking:** A global sequence lock prevents commands from firing while the screen is being swiped/read.
 
@@ -70,23 +67,33 @@ Go to **Settings > Devices & Services > MQTT**. A new device **BYD App Bridge** 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `PHONE_IP` | *None* | **Required.** The LAN IP of your Android phone (e.g., `192.168.1.55`). |
-| `MQTT_BROKER` | `192.168.1.40` | IP of MQTT Broker. |
-| `MQTT_USER` / `_PASS` | *None* | MQTT Credentials. |
+| `MQTT_BROKER` | *None* | **Required.** IP of Home Assistant/Mosquitto. |
+| `MQTT_PORT` | `1883` | Port for MQTT. |
+| `MQTT_USER` | *None* | Username for MQTT. |
+| `MQTT_PASS` | *None* | Password for MQTT. |
+| `ADB_PORT` | `5555` | Port for ADB. |
 
-#### Polling Logic
+#### Polling Logic & Battery Saving
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `POLL_SECONDS` | `60` | Loop interval when active. |
-| `POLL_CHARGING_SECONDS` | `30` | Loop interval when "Charging" text is detected. |
-| `POLL_IDLE_SECONDS` | `600` | Loop interval when inactive for >15 mins. |
+| `POLL_SECONDS` | `60` | Loop interval. **Set to `3600` (1hr) to save car battery.** |
 
 #### Features (1=On, 0=Off)
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `POLL_VEHICLE_STATUS` | `1` | Scrapes Tire Pressure/Doors page. |
-| `POLL_AC` | `1` | Scrapes AC page. |
-| `POLL_VEHICLE_POSITION`| `1` | Scrapes GPS page. |
+| `POLL_VEHICLE_POSITION`| `True` | **Critical:** Scrapes GPS page. **Set to `0` or `false` to stop battery drain.** |
+| `POLL_VEHICLE_STATUS` | `True` | Scrapes Tire Pressure/Doors page. |
+| `POLL_AC` | `True` | Scrapes AC page. |
 | `BYD_PIN` | *None* | **Required for Actions.** Your car's PIN code. |
+
+#### Advanced Configuration
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `MQTT_TOPIC_BASE` | `byd/app` | Topic prefix. |
+| `BYD_DEVICE_ID` | `byd-vehicle` | Unique ID for HA discovery. |
+| `BYD_DEVICE_NAME` | `BYD Vehicle` | Friendly name in HA. |
+| `HTTP_STATUS_PORT` | `8080` | Port for health check/metrics. |
+| `DISCOVERY_PREFIX` | `homeassistant` | MQTT discovery prefix. |
 
 ## 🛠️ Troubleshooting
 

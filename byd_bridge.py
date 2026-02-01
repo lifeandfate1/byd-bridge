@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 BYD Bridge — ADB-driven scraper + MQTT publisher for Home Assistant.
-(Refactored Architecture + Critical Fixes Only. No Adaptive Polling. No Self-Healing.)
+(Refactored Architecture + Adaptive Polling)
 """
 
 import os
@@ -11,7 +11,7 @@ import queue
 import threading
 import http.server
 import socketserver
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Callable, Tuple
 from datetime import datetime, timezone
 from subprocess import Popen, PIPE, TimeoutExpired
@@ -143,6 +143,10 @@ def env_int(name: str, default: int) -> int:
     try: return int(v)
     except ValueError: return default
 
+def env_list(name: str, default: str) -> List[str]:
+    v = os.getenv(name, default)
+    return [s.strip().lower() for s in v.split(",") if s.strip()]
+
 # ---------- Configuration ----------
 
 @dataclass
@@ -154,7 +158,16 @@ class Config:
     topic_base: str
     device_id: str
     device_name: str
-    poll_seconds: int
+    
+    # Adaptive Polling Intervals
+    poll_shutdown: int
+    poll_charging: int
+    poll_running: int
+    
+    # State Keywords
+    keywords_shutdown: List[str]
+    keywords_charging: List[str]
+
     phone_ip: str
     adb_port: int
     enable_vehicle_status: bool
@@ -178,7 +191,16 @@ def load_config() -> Config:
         topic_base=os.getenv("MQTT_TOPIC_BASE", "byd/app").rstrip("/"),
         device_id=os.getenv("BYD_DEVICE_ID", "byd-vehicle"),
         device_name=os.getenv("BYD_DEVICE_NAME", "BYD Vehicle"),
-        poll_seconds=env_int("POLL_SECONDS", 60),
+        
+        # New Adaptive Polling Config
+        poll_shutdown=env_int("POLL_SHUTDOWN_SECONDS", 300), # Default 5 mins
+        poll_charging=env_int("POLL_CHARGING_SECONDS", 60),  # Default 1 min
+        poll_running=env_int("POLL_RUNNING_SECONDS", 120),   # Default 2 mins
+        
+        # Keywords for state detection (Comma separated env vars)
+        keywords_shutdown=env_list("KEYWORDS_SHUTDOWN", "switched off,unavailable,off"),
+        keywords_charging=env_list("KEYWORDS_CHARGING", "charging,plugged,charge"),
+
         phone_ip=phone_ip,
         adb_port=env_int("ADB_PORT", 5555),
         enable_vehicle_status=env_bool("POLL_VEHICLE_STATUS", True),
@@ -196,7 +218,7 @@ class _StatusHandler(http.server.BaseHTTPRequestHandler):
         "poll_cycles_total": 0, "poll_failures_total": 0,
         "adb_calls_total": 0, "dumps_failed_total": 0, "mqtt_publishes_total": 0,
     }
-    LAST_HEALTH = {"last_ok": "", "mqtt": "unknown"}
+    LAST_HEALTH = {"last_ok": "", "mqtt": "unknown", "last_state": "unknown"}
     def log_message(self, format, *args): return
     def do_GET(self):
         if self.path == "/healthz":
@@ -315,7 +337,7 @@ class MQTT:
 # ---------- Discovery ----------
 
 def device_info(cfg: Config) -> Dict[str, Any]:
-    return {"identifiers":[cfg.device_id], "manufacturer":"BYD", "name":cfg.device_name, "model":"BYD App Bridge", "sw_version":"2.0.0-fixed"}
+    return {"identifiers":[cfg.device_id], "manufacturer":"BYD", "name":cfg.device_name, "model":"BYD App Bridge", "sw_version":"2.1.0-adaptive"}
 
 def disc_topic(cfg: Config, domain: str, object_id: str) -> str:
     return f"{cfg.discovery_prefix}/{domain}/{object_id}/config"
@@ -534,7 +556,7 @@ def parse_ac_xml(path: str) -> Dict[str, Any]:
         m = re.search(r"(-?\d+(?:\.\d+)?)", _txt(n))
         if m: out["climate_next_temp_c"] = float(m.group(1))
     btn = _find_by_rid(root, SEL["ac_power_btn"])
-    if btn is not None: # FIX: Explicit boolean check to silence warning
+    if btn is not None: 
         texts = [ _txt(n) for n in btn.iter() if _txt(n) ]
         if any("Switch on" in t for t in texts): out["climate_power"] = "off"
         elif any("Switch off" in t for t in texts): out["climate_power"] = "on"
@@ -582,7 +604,7 @@ def _open_vehicle_status(adb: "ADB") -> bool:
         cands = _find_all_text_contains(root, SEL["nav_vehicle_status_text"])
         if cands: target = cands[0]
     if (target is not None) and _adb_tap_center_of(adb, target):
-        time.sleep(3.5) # Wait for load (Fixed from 0.8)
+        time.sleep(3.5) 
         return True
     return False
 
@@ -594,7 +616,7 @@ def _open_ac_page(adb: "ADB") -> bool:
     target = _find_by_rid(root, SEL["home_ac_row"])
     if target is None: target = _find_text_equals(root, SEL["nav_ac_text"])
     if (target is not None) and _adb_tap_center_of(adb, target):
-        time.sleep(3.5) # Wait for load (Fixed from 0.6)
+        time.sleep(3.5) 
         return True
     return False
 
@@ -649,7 +671,6 @@ def execute_command(cfg: Config, adb: ADB, action: str):
         p = dump_xml(adb); 
         try: root = _parse_xml(p)
         except: return
-        # FIX: Explicit boolean check to silence warning
         if (n := _find_by_rid(root, rid)) is not None: _adb_tap_center_of(adb, n)
 
     elif action in ("climate_switch_on", "climate_rapid_heat", "climate_rapid_vent"):
@@ -662,7 +683,6 @@ def execute_command(cfg: Config, adb: ADB, action: str):
             elif action == "climate_rapid_heat": tgt = _find_by_rid(root2, SEL["ac_heat_btn"])
             else: tgt = _find_by_rid(root2, SEL["ac_cool_btn"])
             
-            # FIX: Explicit boolean check to silence warning
             if tgt is not None:
                 _adb_tap_center_of(adb, tgt)
                 _ensure_pin(adb, cfg.byd_pin)
@@ -670,16 +690,19 @@ def execute_command(cfg: Config, adb: ADB, action: str):
 
 # ---------- Tasks ----------
 
-def task_home(cfg: Config, adb: ADB, mq: MQTT):
+def task_home(cfg: Config, adb: ADB, mq: MQTT) -> Optional[str]:
+    """Returns the 'car_status' string found (or empty string if none)"""
     # RESTORED: Sequence Lock
     with SEQUENCE_LOCK:
         path = dump_xml(adb)
         vals = parse_home_xml(path)
         if not vals:
             jslog("WRN", "home XML yielded no values; skipping publish")
-            return
+            return None
         for key, value in vals.items():
             mq.publish(f"{cfg.topic_base}/{key}", json.dumps(value) if isinstance(value, (dict,list)) else str(value), retain=True, qos=1)
+        
+        return vals.get("car_status", "")
 
 def task_vehicle_status(cfg: Config, adb: ADB, mq: MQTT):
     # RESTORED: Sequence Lock
@@ -692,9 +715,9 @@ def task_vehicle_status(cfg: Config, adb: ADB, mq: MQTT):
         top = dump_xml(adb)
         vals_top = parse_status_xmls(top, top)
 
-        # Scroll (Fixed: calling the helper)
+        # Scroll
         _scroll_down_once(adb)
-        time.sleep(1.0) # Wait for scroll to settle
+        time.sleep(1.0) 
 
         # Bottom half
         bottom = dump_xml(adb)
@@ -753,7 +776,6 @@ class CommandWorker:
         while True:
             action = self.q.get()
             try:
-                # RESTORED: Sequence Lock prevents interruption of scrapes
                 with SEQUENCE_LOCK:
                     execute_command(self.cfg, self.adb, action)
             except Exception as e:
@@ -763,7 +785,8 @@ class CommandWorker:
 def build_caps(cfg: Config) -> Dict[str, bool]:
     return {"home": True, "status": cfg.enable_vehicle_status, "position": cfg.enable_vehicle_position, "ac": cfg.enable_ac_page}
 
-def build_tasks(cfg: Config) -> List[Callable[[Config, ADB, MQTT], None]]:
+def build_tasks(cfg: Config) -> List[Callable[[Config, ADB, MQTT], Any]]:
+    # task_home must be first to capture state
     tasks = [task_home]
     if cfg.enable_vehicle_status: tasks.append(task_vehicle_status)
     if cfg.enable_vehicle_position: tasks.append(task_vehicle_position)
@@ -772,7 +795,10 @@ def build_tasks(cfg: Config) -> List[Callable[[Config, ADB, MQTT], None]]:
 
 def main():
     cfg = load_config()
-    jslog("INF", "boot", modules={"vehicle_status":cfg.enable_vehicle_status,"vehicle_position":cfg.enable_vehicle_position,"ac_page":cfg.enable_ac_page})
+    jslog("INF", "boot", 
+          intervals={"run":cfg.poll_running, "chg":cfg.poll_charging, "off":cfg.poll_shutdown},
+          keywords={"off":cfg.keywords_shutdown, "chg":cfg.keywords_charging}
+    )
 
     maybe_start_status_server(cfg.http_status_port)
 
@@ -794,23 +820,51 @@ def main():
     tasks = build_tasks(cfg)
     consecutive_failures = 0
     
-    # Simple Loop: No Adaptive Polling
+    # Main Loop with Adaptive Polling
     while True:
         _StatusHandler.METRICS["poll_cycles_total"] += 1
         t0 = time.time()
+        
+        detected_status_text = ""
+        poll_mode = "RUNNING" # Default safety
+        delay = cfg.poll_running
+
         try:
-            for t in tasks: t(cfg, adb, mq)
+            # Run tasks. task_home (index 0) returns the status string.
+            for i, t in enumerate(tasks):
+                res = t(cfg, adb, mq)
+                if i == 0 and isinstance(res, str):
+                    detected_status_text = res
+
+            # Determine Adaptive Interval
+            st_clean = detected_status_text.lower()
+            if any(k in st_clean for k in cfg.keywords_shutdown):
+                poll_mode = "SHUTDOWN"
+                delay = cfg.poll_shutdown
+            elif any(k in st_clean for k in cfg.keywords_charging):
+                poll_mode = "CHARGING"
+                delay = cfg.poll_charging
+            else:
+                poll_mode = "RUNNING"
+                delay = cfg.poll_running
+
+            # Log decision for user debugging
+            jslog("INF", "state detect", text=detected_status_text, mode=poll_mode, next_poll_in=delay)
+            _StatusHandler.LAST_HEALTH["last_state"] = poll_mode
+
             consecutive_failures = 0
             _StatusHandler.LAST_HEALTH["last_ok"] = datetime.now(timezone.utc).isoformat()
+        
         except Exception as e:
             _StatusHandler.METRICS["poll_failures_total"] += 1
             consecutive_failures += 1
             jslog("ERR", "poll iteration failed", error=str(e), failures=consecutive_failures)
+            # On failure, stick to the default delay (usually running) to retry reasonably soon
+            delay = cfg.poll_running
         
-        # Simple sleep logic
-        delay = cfg.poll_seconds
-        elapsed = time.time()-t0
-        time.sleep(max(0.0, delay - elapsed))
+        elapsed = time.time() - t0
+        sleep_time = max(0.0, delay - elapsed)
+        time.sleep(sleep_time)
 
 if __name__ == "__main__":
     try: main()

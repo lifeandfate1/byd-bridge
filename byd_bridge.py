@@ -5,6 +5,7 @@ BYD Bridge — ADB-driven scraper + MQTT publisher for Home Assistant.
 """
 
 import os
+import sys
 import json
 import time
 import queue
@@ -24,8 +25,8 @@ SEQUENCE_LOCK = threading.RLock()
 
 # ---- STATE DEFINITIONS (CONSTANTS) ----
 # Update these lists with the exact text found in the logs
-STRINGS_SHUTDOWN = ["Switched off", "unavailable", "off"]
-STRINGS_CHARGING = ["EV Charging", "Plugged in", "3.4kW", "charging"]
+STRINGS_SHUTDOWN = ["Switched off", "unavailable"]
+STRINGS_CHARGING = ["EV Charging", "Plugged in", "Charging"]
 
 # NOTE: Since "Running" is the default "else" state, any text NOT in the 
 # lists above will trigger the Running interval. These are here for reference.
@@ -868,7 +869,9 @@ def main():
             _StatusHandler.METRICS["poll_failures_total"] += 1
             consecutive_failures += 1
             jslog("ERR", "poll iteration failed", error=str(e), failures=consecutive_failures)
-            # On failure, stick to the default delay (usually running) to retry reasonably soon
+            if consecutive_failures >= 5:
+                jslog("FATAL", "Too many consecutive failures. Exiting to trigger Docker restart.")
+                sys.exit(1)
             delay = cfg.poll_running
         
         elapsed = time.time() - t0

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 BYD Bridge — ADB-driven scraper + MQTT publisher for Home Assistant.
-(Refactored Architecture + Adaptive Polling)
+(Refactored Architecture + Adaptive Polling with Hardcoded Constants)
 """
 
 import os
@@ -21,6 +21,15 @@ import xml.etree.ElementTree as ET
 # ---- Global Locks ----
 ADB_LOCK = threading.RLock()
 SEQUENCE_LOCK = threading.RLock()
+
+# ---- STATE DEFINITIONS (CONSTANTS) ----
+# Update these lists with the exact text found in the logs
+STRINGS_SHUTDOWN = ["Switched off", "unavailable", "off"]
+STRINGS_CHARGING = ["EV Charging", "Plugged in", "3.4kW", "charging"]
+
+# NOTE: Since "Running" is the default "else" state, any text NOT in the 
+# lists above will trigger the Running interval. These are here for reference.
+STRINGS_RUNNING  = ["Ready", "OK", "Driving", "Started"] 
 
 # ---- BYD selectors ----
 SEL = {
@@ -164,9 +173,7 @@ class Config:
     poll_charging: int
     poll_running: int
     
-    # State Keywords
-    keywords_shutdown: List[str]
-    keywords_charging: List[str]
+    # (Removed dynamic keyword lists; using Global Constants instead)
 
     phone_ip: str
     adb_port: int
@@ -197,9 +204,7 @@ def load_config() -> Config:
         poll_charging=env_int("POLL_CHARGING_SECONDS", 60),  # Default 1 min
         poll_running=env_int("POLL_RUNNING_SECONDS", 120),   # Default 2 mins
         
-        # Keywords for state detection (Comma separated env vars)
-        keywords_shutdown=env_list("KEYWORDS_SHUTDOWN", "switched off,unavailable,off"),
-        keywords_charging=env_list("KEYWORDS_CHARGING", "charging,plugged,charge"),
+        # (Removed env_list calls for keywords here)
 
         phone_ip=phone_ip,
         adb_port=env_int("ADB_PORT", 5555),
@@ -797,7 +802,7 @@ def main():
     cfg = load_config()
     jslog("INF", "boot", 
           intervals={"run":cfg.poll_running, "chg":cfg.poll_charging, "off":cfg.poll_shutdown},
-          keywords={"off":cfg.keywords_shutdown, "chg":cfg.keywords_charging}
+          # Removed keywords from log output as they are now hardcoded
     )
 
     maybe_start_status_server(cfg.http_status_port)
@@ -838,13 +843,17 @@ def main():
 
             # Determine Adaptive Interval
             st_clean = detected_status_text.lower()
-            if any(k in st_clean for k in cfg.keywords_shutdown):
+            
+            # Use Hardcoded Lists
+            if any(s.lower() in st_clean for s in STRINGS_SHUTDOWN):
                 poll_mode = "SHUTDOWN"
                 delay = cfg.poll_shutdown
-            elif any(k in st_clean for k in cfg.keywords_charging):
+            elif any(s.lower() in st_clean for s in STRINGS_CHARGING):
                 poll_mode = "CHARGING"
                 delay = cfg.poll_charging
             else:
+                # Default to running if it matches nothing (Safety)
+                # This explicitly covers "Driving", "Started", "Ready", etc.
                 poll_mode = "RUNNING"
                 delay = cfg.poll_running
 

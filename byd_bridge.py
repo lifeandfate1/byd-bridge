@@ -28,7 +28,7 @@ SEQUENCE_LOCK = threading.RLock()
 STRINGS_SHUTDOWN = ["Switched off", "unavailable"]
 STRINGS_CHARGING = ["EV Charging", "Plugged in", "Charging"]
 # "Running" is the catch-all state, but these are here for reference:
-STRINGS_RUNNING  = ["Ready", "OK", "Driving", "Started"] 
+STRINGS_RUNNING  = ["Commenced", "Driving", "Started"]
 
 # ---- BYD selectors ----
 SEL = {

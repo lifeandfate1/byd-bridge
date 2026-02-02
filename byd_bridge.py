@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 BYD Bridge — ADB-driven scraper + MQTT publisher for Home Assistant.
-(Refactored Architecture + Adaptive Polling with Hardcoded Constants)
+(Refactored Architecture + Adaptive Polling + Deep Sleep Saver + Self-Healing)
 """
 
 import os
@@ -12,7 +12,7 @@ import queue
 import threading
 import http.server
 import socketserver
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Callable, Tuple
 from datetime import datetime, timezone
 from subprocess import Popen, PIPE, TimeoutExpired
@@ -24,12 +24,9 @@ ADB_LOCK = threading.RLock()
 SEQUENCE_LOCK = threading.RLock()
 
 # ---- STATE DEFINITIONS (CONSTANTS) ----
-# Update these lists with the exact text found in the logs
 STRINGS_SHUTDOWN = ["Switched off", "unavailable"]
 STRINGS_CHARGING = ["EV Charging", "Plugged in", "Charging"]
-
-# NOTE: Since "Running" is the default "else" state, any text NOT in the 
-# lists above will trigger the Running interval. These are here for reference.
+# "Running" is the default catch-all state.
 STRINGS_RUNNING  = ["Ready", "OK", "Driving", "Started"] 
 
 # ---- BYD selectors ----
@@ -174,8 +171,6 @@ class Config:
     poll_charging: int
     poll_running: int
     
-    # (Removed dynamic keyword lists; using Global Constants instead)
-
     phone_ip: str
     adb_port: int
     enable_vehicle_status: bool
@@ -205,8 +200,6 @@ def load_config() -> Config:
         poll_charging=env_int("POLL_CHARGING_SECONDS", 60),  # Default 1 min
         poll_running=env_int("POLL_RUNNING_SECONDS", 120),   # Default 2 mins
         
-        # (Removed env_list calls for keywords here)
-
         phone_ip=phone_ip,
         adb_port=env_int("ADB_PORT", 5555),
         enable_vehicle_status=env_bool("POLL_VEHICLE_STATUS", True),
@@ -791,19 +784,10 @@ class CommandWorker:
 def build_caps(cfg: Config) -> Dict[str, bool]:
     return {"home": True, "status": cfg.enable_vehicle_status, "position": cfg.enable_vehicle_position, "ac": cfg.enable_ac_page}
 
-def build_tasks(cfg: Config) -> List[Callable[[Config, ADB, MQTT], Any]]:
-    # task_home must be first to capture state
-    tasks = [task_home]
-    if cfg.enable_vehicle_status: tasks.append(task_vehicle_status)
-    if cfg.enable_vehicle_position: tasks.append(task_vehicle_position)
-    if cfg.enable_ac_page: tasks.append(task_ac_page)
-    return tasks
-
 def main():
     cfg = load_config()
     jslog("INF", "boot", 
           intervals={"run":cfg.poll_running, "chg":cfg.poll_charging, "off":cfg.poll_shutdown},
-          # Removed keywords from log output as they are now hardcoded
     )
 
     maybe_start_status_server(cfg.http_status_port)
@@ -823,10 +807,9 @@ def main():
         worker.submit(action)
     mq.subscribe_handler(f"{cfg.topic_base}/cmd/#", on_mqtt_cmd)
 
-    tasks = build_tasks(cfg)
     consecutive_failures = 0
     
-    # Main Loop with Adaptive Polling
+    # Main Loop with Adaptive Polling, Deep Sleep, and Self-Healing
     while True:
         _StatusHandler.METRICS["poll_cycles_total"] += 1
         t0 = time.time()
@@ -836,16 +819,15 @@ def main():
         delay = cfg.poll_running
 
         try:
-            # Run tasks. task_home (index 0) returns the status string.
-            for i, t in enumerate(tasks):
-                res = t(cfg, adb, mq)
-                if i == 0 and isinstance(res, str):
-                    detected_status_text = res
+            # --- PHASE 1: Always Run Home Task ---
+            # This is the "Lightweight" check to see what the car is doing.
+            res = task_home(cfg, adb, mq)
+            if isinstance(res, str):
+                detected_status_text = res
 
-            # Determine Adaptive Interval
+            # --- PHASE 2: State Detection ---
             st_clean = detected_status_text.lower()
             
-            # Use Hardcoded Lists
             if any(s.lower() in st_clean for s in STRINGS_SHUTDOWN):
                 poll_mode = "SHUTDOWN"
                 delay = cfg.poll_shutdown
@@ -853,15 +835,28 @@ def main():
                 poll_mode = "CHARGING"
                 delay = cfg.poll_charging
             else:
-                # Default to running if it matches nothing (Safety)
-                # This explicitly covers "Driving", "Started", "Ready", etc.
                 poll_mode = "RUNNING"
                 delay = cfg.poll_running
 
-            # Log decision for user debugging
+            # --- PHASE 3: Conditional "Deep Sleep" Execution ---
+            # Suggestion 1: Only run heavy tasks if NOT shutdown
+            if poll_mode != "SHUTDOWN":
+                if cfg.enable_vehicle_status:
+                    task_vehicle_status(cfg, adb, mq)
+                if cfg.enable_vehicle_position:
+                    task_vehicle_position(cfg, adb, mq)
+                if cfg.enable_ac_page:
+                    task_ac_page(cfg, adb, mq)
+            else:
+                # Log that we are skipping heavy tasks to save power/time
+                # Only logging every 5th cycle to prevent log spam if needed, or just standard info:
+                jslog("INF", "skipping heavy tasks (status/pos/ac) due to shutdown mode")
+
+            # Log decision
             jslog("INF", "state detect", text=detected_status_text, mode=poll_mode, next_poll_in=delay)
             _StatusHandler.LAST_HEALTH["last_state"] = poll_mode
 
+            # Reset failures on success
             consecutive_failures = 0
             _StatusHandler.LAST_HEALTH["last_ok"] = datetime.now(timezone.utc).isoformat()
         
@@ -869,9 +864,27 @@ def main():
             _StatusHandler.METRICS["poll_failures_total"] += 1
             consecutive_failures += 1
             jslog("ERR", "poll iteration failed", error=str(e), failures=consecutive_failures)
+
+            # --- PHASE 4: Self-Healing (Suggestion 5) ---
+            
+            # Soft Healing: Try to reconnect ADB on failure #3
+            if consecutive_failures == 3:
+                jslog("WRN", "Attempting soft ADB reconnect...")
+                try:
+                    # Disconnect specifically the target phone to clear stale state
+                    adb.shell("disconnect") 
+                    time.sleep(2)
+                    # Re-run the connect command from host side
+                    Popen(["adb", "connect", f"{cfg.phone_ip}:{cfg.adb_port}"]).wait()
+                except Exception as ex:
+                    jslog("ERR", "Soft reconnect failed", error=str(ex))
+
+            # Hard Kill Switch: Exit on failure #5
             if consecutive_failures >= 5:
                 jslog("FATAL", "Too many consecutive failures. Exiting to trigger Docker restart.")
                 sys.exit(1)
+
+            # Default to shorter delay on failure to retry soon
             delay = cfg.poll_running
         
         elapsed = time.time() - t0

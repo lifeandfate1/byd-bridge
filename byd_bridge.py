@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 BYD Bridge — ADB-driven scraper + MQTT publisher for Home Assistant.
-(Refactored Architecture + Adaptive Polling + Deep Sleep Saver + Self-Healing)
+(Refactored Architecture + Adaptive Polling + Deep Sleep + Self-Healing + Smart Recovery)
 """
 
 import os
@@ -24,9 +24,10 @@ ADB_LOCK = threading.RLock()
 SEQUENCE_LOCK = threading.RLock()
 
 # ---- STATE DEFINITIONS (CONSTANTS) ----
+# Code will check these lists to determine polling speed.
 STRINGS_SHUTDOWN = ["Switched off", "unavailable"]
 STRINGS_CHARGING = ["EV Charging", "Plugged in", "Charging"]
-# "Running" is the default catch-all state.
+# "Running" is the catch-all state, but these are here for reference:
 STRINGS_RUNNING  = ["Ready", "OK", "Driving", "Started"] 
 
 # ---- BYD selectors ----
@@ -57,7 +58,7 @@ SEL = {
     "temp_up": "com.byd.bydautolink:id/btn_temperature_plus",
     "temp_down": "com.byd.bydautolink:id/btn_temperature_reduce",
 
-    # Nav Text
+    # Nav Text (Used for Smart Recovery)
     "nav_vehicle_status_text": "Vehicle status",
     "nav_vehicle_position_text": "Vehicle position",
     "nav_ac_text": "A/C",
@@ -633,6 +634,56 @@ def _open_vehicle_position(adb: "ADB") -> bool:
         return True
     return False
 
+# --- Smart State Recovery (New Feature) ---
+def parse_xml_safe(path: str) -> Optional[ET.Element]:
+    try: return _parse_xml(path)
+    except: return None
+
+def ensure_home_state(cfg: Config, adb: ADB) -> bool:
+    """
+    Intelligently navigates back to the Home screen.
+    Returns True if Home is reached, False if failed.
+    """
+    for attempt in range(3): # Try 3 times to fix the state
+        # 1. Take a snapshot
+        xml_path = dump_xml(adb)
+        root = parse_xml_safe(xml_path) 
+        if root is None: 
+            continue # Bad dump, try again
+
+        # 2. Check: Are we already Home? (The Ideal State)
+        # We look for the "Car Status" text ID which is unique to Home
+        if _find_by_rid(root, SEL["home_car_status"]) is not None:
+            if attempt > 0: jslog("INF", "Recovered to Home screen")
+            return True
+
+        # 3. Check: Are we in a known Sub-Page? (The "Stuck" State)
+        # Check for Vehicle Status Title
+        if _find_text_equals(root, SEL["nav_vehicle_status_text"]) or \
+           _find_all_text_contains(root, SEL["nav_vehicle_status_text"]):
+            jslog("WRN", "Stuck on Status page. Pressing BACK.")
+            adb.shell("input keyevent 4") # Back
+            time.sleep(2.0)
+            continue
+            
+        # Check for A/C Page specific ID
+        if _find_by_rid(root, SEL["ac_heat_btn"]):
+            jslog("WRN", "Stuck on A/C page. Pressing BACK.")
+            adb.shell("input keyevent 4") # Back
+            time.sleep(2.0)
+            continue
+
+        # 4. Check: Are we completely lost? (The "Crashed" State)
+        # If we see none of the above, we are likely not in the app.
+        jslog("WRN", "App not detected. Launching BYD App...")
+        # Launch command
+        adb.shell("monkey -p com.byd.bydautolink -c android.intent.category.LAUNCHER 1")
+        time.sleep(6.0) # Launching takes longer
+    
+    # If we exit the loop, we failed to find Home after 3 corrective actions
+    jslog("ERR", "Could not recover to Home screen after 3 attempts")
+    return False
+
 # --- Actions (Fixed) ---
 def execute_command(cfg: Config, adb: ADB, action: str):
     # RESTORED: Sequence lock is acquired in CommandWorker before calling this
@@ -819,6 +870,12 @@ def main():
         delay = cfg.poll_running
 
         try:
+            # --- PHASE 0: Smart State Recovery ---
+            # Ensure we are on the Home screen before we start.
+            # This handles "Stuck on Sub-page" and "Crashed to Desktop".
+            if not ensure_home_state(cfg, adb):
+                raise Exception("Failed to navigate to Home Screen")
+
             # --- PHASE 1: Always Run Home Task ---
             # This is the "Lightweight" check to see what the car is doing.
             res = task_home(cfg, adb, mq)
@@ -828,6 +885,7 @@ def main():
             # --- PHASE 2: State Detection ---
             st_clean = detected_status_text.lower()
             
+            # Check Hardcoded Constants for State
             if any(s.lower() in st_clean for s in STRINGS_SHUTDOWN):
                 poll_mode = "SHUTDOWN"
                 delay = cfg.poll_shutdown
@@ -848,8 +906,6 @@ def main():
                 if cfg.enable_ac_page:
                     task_ac_page(cfg, adb, mq)
             else:
-                # Log that we are skipping heavy tasks to save power/time
-                # Only logging every 5th cycle to prevent log spam if needed, or just standard info:
                 jslog("INF", "skipping heavy tasks (status/pos/ac) due to shutdown mode")
 
             # Log decision
@@ -871,10 +927,8 @@ def main():
             if consecutive_failures == 3:
                 jslog("WRN", "Attempting soft ADB reconnect...")
                 try:
-                    # Disconnect specifically the target phone to clear stale state
                     adb.shell("disconnect") 
                     time.sleep(2)
-                    # Re-run the connect command from host side
                     Popen(["adb", "connect", f"{cfg.phone_ip}:{cfg.adb_port}"]).wait()
                 except Exception as ex:
                     jslog("ERR", "Soft reconnect failed", error=str(ex))

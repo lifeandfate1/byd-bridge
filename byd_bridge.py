@@ -61,6 +61,7 @@ class Selectors:
     home_setpoint: str = "com.byd.bydautolink:id/tem_tv"
     home_car_status: str = "com.byd.bydautolink:id/h_car_name_tv"
     home_last_update: str = "com.byd.bydautolink:id/tv_update_time"
+    home_refresh_btn: str = "com.byd.bydautolink:id/btn_touch_refresh"
 
     # Home (tap targets)
     home_ac_row: str = "com.byd.bydautolink:id/c_air_item_rl_2"
@@ -731,6 +732,22 @@ def _open_vehicle_position(adb: "ADB") -> bool:
     return False
 
 # --- Smart State Recovery (New Feature) ---
+
+def _is_screen_on(adb: "ADB") -> bool:
+    """Checks if the screen is currently on (Awake)."""
+    # 'mWakefulness=Awake' is the standard indicator in dumpsys power
+    out = adb.shell("dumpsys power")
+    return "mWakefulness=Awake" in out
+
+def _wake_and_unlock(adb: "ADB"):
+    """Wakes the device and swipes up to dismiss keyguard."""
+    log_extra(logger, logging.INFO, "Screen is OFF. Waking device...")
+    adb.shell("input keyevent 224") # KEYCODE_WAKEUP
+    time.sleep(1.0)
+    # Swipe up to dismiss any non-PIN lockscreen
+    adb.shell("input swipe 500 2000 500 500 300")
+    time.sleep(1.5)
+
 def parse_xml_safe(path: str) -> Optional[ET.Element]:
     try: return _parse_xml(path)
     except: return None
@@ -741,6 +758,12 @@ def ensure_home_state(cfg: Config, adb: ADB) -> bool:
     Returns True if Home is reached, False if failed.
     """
     for attempt in range(3): # Try 3 times to fix the state
+        # 0. Pre-Check: Is Screen On?
+        if not _is_screen_on(adb):
+            _wake_and_unlock(adb)
+            # Loop back to take a fresh dump
+            continue
+
         # 1. Take a snapshot
         xml_path = dump_xml(adb)
         root = parse_xml_safe(xml_path) 
@@ -839,6 +862,23 @@ def execute_command(cfg: Config, adb: ADB, action: str):
 def task_home(cfg: Config, adb: ADB, mq: MQTT) -> Optional[str]:
     """Returns the 'car_status' string found (or empty string if none)"""
     with SEQUENCE_LOCK:
+        log_extra(logger, logging.INFO, "Refreshing Home Page...")
+        
+        # 1. Find and Tap Refresh Button
+        # We take a preliminary snapshot just to find the button
+        p_refresh = dump_xml(adb)
+        root_refresh = parse_xml_safe(p_refresh)
+        
+        if root_refresh is not None:
+            btn = _find_by_rid(root_refresh, SEL.home_refresh_btn)
+            if btn is not None:
+                log_extra(logger, logging.INFO, "Found Refresh Button - Tapping")
+                _adb_tap_center_of(adb, btn)
+                time.sleep(5.0) # Wait for network refresh
+            else:
+                log_extra(logger, logging.WARNING, "Refresh button not found (possibly not on top/home?)")
+
+        # 2. Capture Final Data
         path = dump_xml(adb)
         vals = parse_home_xml(path)
         if not vals:

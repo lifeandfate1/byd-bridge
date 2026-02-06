@@ -19,6 +19,7 @@ The Python script does not handle the connection; it assumes the environment has
 * **🛡️ Robustness:**
     * **Ghosting Protection:** Filters out placeholder values (`--`, `---`) so Home Assistant history remains clean.
     * **Race Condition Locking:** A global sequence lock prevents commands from firing while the screen is being swiped/read.
+    * **Smart Recovery:** Detects if the app is crashed or stuck on the wrong screen and automatically relaunches/navigates back to home.
 
 ![Architecture Diagram](images/diagram.png)
 
@@ -76,7 +77,9 @@ Go to **Settings > Devices & Services > MQTT**. A new device **BYD App Bridge** 
 #### Polling Logic & Battery Saving
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `POLL_SECONDS` | `60` | Loop interval. **Set to `3600` (1hr) to save car battery.** |
+| `POLL_SHUTDOWN_SECONDS` | `300` | Interval when car is "Switched off" (Deep Sleep). |
+| `POLL_CHARGING_SECONDS` | `60` | Interval when car is charging. |
+| `POLL_RUNNING_SECONDS` | `120` | Interval when car is driving/running. |
 
 #### Features (1=On, 0=Off)
 | Variable | Default | Description |

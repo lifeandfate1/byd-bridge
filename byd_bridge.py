@@ -572,7 +572,7 @@ def dump_xml(adb: ADB) -> str:
 # --- Page Parsers ---
 def parse_home_xml(path: str) -> Dict[str, Any]:
     root = _parse_xml(path)
-    if not root: return {}
+    if root is None: return {}
     
     out: Dict[str, Any] = {}
     if (n := _find_by_rid(root, SEL.home_soc)) is not None:
@@ -595,7 +595,7 @@ def parse_home_xml(path: str) -> Dict[str, Any]:
 
 def parse_status_xmls(top_path: str, bottom_path: str) -> Dict[str, Any]:
     root = _parse_xml(top_path)
-    if not root: return {}
+    if root is None: return {}
     
     text_nodes = [(_txt(n), n) for n in _all_nodes(root) if _txt(n)]
     out: Dict[str, Any] = {}
@@ -640,7 +640,7 @@ def parse_status_xmls(top_path: str, bottom_path: str) -> Dict[str, Any]:
 
 def parse_ac_xml(path: str) -> Dict[str, Any]:
     root = _parse_xml(path)
-    if not root: return {}
+    if root is None: return {}
     
     out: Dict[str, Any] = {}
     if (n := _find_by_rid(root, SEL.ac_setpoint)) is not None:
@@ -661,7 +661,7 @@ def parse_ac_xml(path: str) -> Dict[str, Any]:
 
 def parse_position_xml(path: str) -> Dict[str, Any]:
     root = _parse_xml(path)
-    if not root: return {}
+    if root is None: return {}
     
     latlon = None
     for n in _all_nodes(root):
@@ -693,7 +693,7 @@ def _ensure_pin(adb: ADB, pin: str):
 def _open_vehicle_status(adb: "ADB") -> bool:
     p = dump_xml(adb)
     root = _parse_xml(p)
-    if not root: return False
+    if root is None: return False
     
     target = _find_text_equals(root, SEL.nav_vehicle_status_text)
     if target is None:
@@ -707,7 +707,7 @@ def _open_vehicle_status(adb: "ADB") -> bool:
 def _open_ac_page(adb: "ADB") -> bool:
     p = dump_xml(adb)
     root = _parse_xml(p)
-    if not root: return False
+    if root is None: return False
     
     target = _find_by_rid(root, SEL.home_ac_row)
     if target is None: target = _find_text_equals(root, SEL.nav_ac_text)
@@ -719,7 +719,7 @@ def _open_ac_page(adb: "ADB") -> bool:
 def _open_vehicle_position(adb: "ADB") -> bool:
     p = dump_xml(adb)
     root = _parse_xml(p)
-    if not root: return False
+    if root is None: return False
     
     target = _find_text_equals(root, SEL.nav_vehicle_position_text)
     if target is None:
@@ -789,7 +789,7 @@ def execute_command(cfg: Config, adb: ADB, action: str):
     if action == "unlock":
         p = dump_xml(adb) 
         root = _parse_xml(p)
-        if not root: return
+        if root is None: return
         tiles = []
         for n in _all_nodes(root):
             if _rid(n) == SEL.quick_control_row: tiles.append(_bounds(n))
@@ -802,7 +802,7 @@ def execute_command(cfg: Config, adb: ADB, action: str):
     elif action == "lock":
         p = dump_xml(adb)
         root = _parse_xml(p)
-        if not root: return
+        if root is None: return
         tiles = []
         for n in _all_nodes(root):
             if _rid(n) == SEL.quick_control_row: tiles.append(_bounds(n))
@@ -816,14 +816,14 @@ def execute_command(cfg: Config, adb: ADB, action: str):
         rid = SEL.temp_up if action == "ac_up" else SEL.temp_down
         p = dump_xml(adb)
         root = _parse_xml(p)
-        if not root: return
+        if root is None: return
         if (n := _find_by_rid(root, rid)) is not None: _adb_tap_center_of(adb, n)
 
     elif action in ("climate_switch_on", "climate_rapid_heat", "climate_rapid_vent"):
         if _open_ac_page(adb):
             p2 = dump_xml(adb) 
             root2 = _parse_xml(p2)
-            if not root2: return
+            if root2 is None: return
             
             if action == "climate_switch_on": tgt = _find_by_rid(root2, SEL.ac_power_btn)
             elif action == "climate_rapid_heat": tgt = _find_by_rid(root2, SEL.ac_heat_btn)

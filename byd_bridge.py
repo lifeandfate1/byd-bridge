@@ -20,12 +20,24 @@ from datetime import datetime, timezone
 from subprocess import Popen, PIPE, TimeoutExpired
 import re
 import xml.etree.ElementTree as ET
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    # Fallback for older Python (though container usually has 3.9+)
+    from datetime import timezone as _basetz
+    ZoneInfo = lambda x: _basetz.utc
 
 # ---- Logging Configuration ----
 class JsonFormatter(logging.Formatter):
     def format(self, record):
+        tz_name = os.getenv("TZ", "UTC")
+        try:
+            tz = ZoneInfo(tz_name)
+        except:
+            tz = timezone.utc
+            
         log_record = {
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(tz).isoformat(),
             "level": record.levelname,
             "msg": record.getMessage(),
             "logger": record.name
@@ -1011,7 +1023,13 @@ def main():
                 try: task_ac_page(cfg, adb, mq)
                 except Exception as e: log_extra(logger, logging.ERROR, "Task AC failed", error=str(e))
 
-        _StatusHandler.LAST_HEALTH["last_ok"] = datetime.now(timezone.utc).isoformat()
+                except Exception as e: log_extra(logger, logging.ERROR, "Task AC failed", error=str(e))
+
+        try:
+             tz = ZoneInfo(os.getenv("TZ", "UTC"))
+        except:
+             tz = timezone.utc
+        _StatusHandler.LAST_HEALTH["last_ok"] = datetime.now(tz).isoformat()
         
         # 6. Sleep Calculation
         elapsed = time.time() - loop_start

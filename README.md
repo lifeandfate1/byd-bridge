@@ -73,6 +73,7 @@ Go to **Settings > Devices & Services > MQTT**. A new device **BYD App Bridge** 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `PHONE_IP` | *None* | **Required.** The LAN IP of your Android phone (e.g., `192.168.1.55`). |
+| `TZ` | `UTC` | Timezone for logs and health check (e.g., `Europe/Zurich`). |
 | `MQTT_BROKER` | *None* | **Required.** IP of Home Assistant/Mosquitto. |
 | `MQTT_PORT` | `1883` | Port for MQTT. |
 | `MQTT_USER` | *None* | Username for MQTT. |

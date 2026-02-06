@@ -13,13 +13,18 @@ The Python script does not handle the connection; it assumes the environment has
 ## ✨ Key Features
 
 * **⚡ Adaptive Polling Engine:**
-    * **Driving:** Polls every **60s** (configurable).
-    * **Instant Wake:** Command queue interrupts polling immediately to execute actions (e.g., Unlock).
+    * **Driving:** Polls every **120s** (configurable).
+    * **Charging:** Polls every **60s**.
+    * **Deep Sleep:** Polls every **300s** (5 mins) when car is off.
+    * **Instant Wake:** Command queue executes actions immediately (e.g., Unlock) without waiting for the next poll cycle.
 
 * **🛡️ Robustness:**
     * **Ghosting Protection:** Filters out placeholder values (`--`, `---`) so Home Assistant history remains clean.
     * **Race Condition Locking:** A global sequence lock prevents commands from firing while the screen is being swiped/read.
     * **Smart Recovery:** Detects if the app is crashed or stuck on the wrong screen and automatically relaunches/navigates back to home.
+    * **Screen Wake Failsafe:** Detects if the screen is off (using `dumpsys power`) and automatically wakes/swipes up to resume scraping.
+    * **Button Refresh:** Uses the dedicated "Refresh" button on the home screen for reliable data updates (replacing unreliable swipe gestures).
+    * **Health Watchdog:** Exposes a `/healthz` HTTP endpoint (default port 8080) that reports 503 if the main loop stalls for >10 minutes.
 
 ![Architecture Diagram](images/diagram.png)
 

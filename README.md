@@ -89,7 +89,6 @@ Go to **Settings > Devices & Services > MQTT**. A new device **BYD App Bridge** 
 #### Features (1=On, 0=Off)
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `POLL_VEHICLE_POSITION`| `True` | **Critical:** Scrapes GPS page. **Set to `0` or `false` to stop battery drain.** |
 | `POLL_VEHICLE_STATUS` | `True` | Scrapes Tire Pressure/Doors page. |
 | `POLL_AC` | `True` | Scrapes AC page. |
 | `BYD_PIN` | *None* | **Required for Actions.** Your car's PIN code. |

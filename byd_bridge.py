@@ -83,7 +83,7 @@ class Selectors:
 
     # Nav Text (Used for Smart Recovery)
     nav_vehicle_status_text: str = "Vehicle status"
-    nav_vehicle_position_text: str = "Vehicle position"
+    nav_vehicle_status_text: str = "Vehicle status"
     nav_ac_text: str = "A/C"
 
 SEL = Selectors()
@@ -201,7 +201,6 @@ class Config:
     phone_ip: str
     adb_port: int
     enable_vehicle_status: bool
-    enable_vehicle_position: bool
     enable_ac_page: bool
     byd_pin: Optional[str]
     http_status_port: int
@@ -235,7 +234,6 @@ def load_config() -> Config:
         phone_ip=phone_ip,
         adb_port=env_int("ADB_PORT", 5555),
         enable_vehicle_status=env_bool("POLL_VEHICLE_STATUS", True),
-        enable_vehicle_position=env_bool("POLL_VEHICLE_POSITION", True),
         enable_ac_page=env_bool("POLL_AC", True),
         byd_pin=read_env_or_file("BYD_PIN", None),
         http_status_port=env_int("HTTP_STATUS_PORT", 8080),
@@ -487,21 +485,7 @@ def publish_discovery(cfg: Config, mq: MQTT, caps: Dict[str, bool]):
             payload.update(AV)
             mq.publish(disc_topic(cfg, "sensor", oid), json.dumps(payload), retain=True, qos=1)
 
-    # Vehicle Position (conditional)
-    if caps.get("position"):
-        dt_oid = "byd_vehicle_tracker"
-        dt_payload = {
-            "uniq_id": f"{dt_oid}_{cfg.device_id}", "name": "BYD Vehicle", "dev": dev,
-            "json_attr_t": f"{cfg.topic_base}/location_json",
-            "state_topic": f"{cfg.topic_base}/vehicle_tracker_state",
-            "icon": "mdi:car-arrow-right",
-        }
-        dt_payload.update(AV)
-        mq.publish(disc_topic(cfg, "device_tracker", dt_oid), json.dumps(dt_payload), retain=True, qos=1)
-        for oid, name, key in [("byd_latitude","Latitude","latitude"),("byd_longitude","Longitude","longitude")]:
-            payload = {"uniq_id": f"{oid}_{cfg.device_id}", "name": name, "stat_t": f"{cfg.topic_base}/{key}", "dev": dev, "icon":"mdi:crosshairs-gps"}
-            payload.update(AV)
-            mq.publish(disc_topic(cfg, "sensor", oid), json.dumps(payload), retain=True, qos=1)
+
 
     # A/C Page (conditional)
     if caps.get("ac"):
@@ -660,18 +644,7 @@ def parse_ac_xml(path: str) -> Dict[str, Any]:
         elif any("Switch off" in t for t in texts): out["climate_power"] = "on"
     return out
 
-def parse_position_xml(path: str) -> Dict[str, Any]:
-    root = _parse_xml(path)
-    if root is None: return {}
-    
-    latlon = None
-    for n in _all_nodes(root):
-        t = _txt(n)
-        m = re.search(r"(-?\d{1,3}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)", t)
-        if m: latlon = (float(m.group(1)), float(m.group(2))); break
-    if latlon:
-        return {"latitude": latlon[0], "longitude": latlon[1], "gps_accuracy": 10}
-    return {}
+
 
 # --- Nav Helpers ---
 def _go_home(adb: ADB):
@@ -717,19 +690,7 @@ def _open_ac_page(adb: "ADB") -> bool:
         return True
     return False
 
-def _open_vehicle_position(adb: "ADB") -> bool:
-    p = dump_xml(adb)
-    root = _parse_xml(p)
-    if root is None: return False
-    
-    target = _find_text_equals(root, SEL.nav_vehicle_position_text)
-    if target is None:
-        c = _find_all_text_contains(root, SEL.nav_vehicle_position_text)
-        target = c[0] if c else None
-    if (target is not None) and _adb_tap_center_of(adb, target):
-        time.sleep(0.8)
-        return True
-    return False
+
 
 # --- Smart State Recovery (New Feature) ---
 
@@ -915,20 +876,7 @@ def task_vehicle_status(cfg: Config, adb: ADB, mq: MQTT):
 
         adb.shell("input keyevent 4", timeout=2.0)
 
-def task_vehicle_position(cfg: Config, adb: ADB, mq: MQTT):
-    with SEQUENCE_LOCK:
-        if not _open_vehicle_position(adb):
-            log_extra(logger, logging.WARNING, "could not open Vehicle position page; skipping")
-            return
-        path = dump_xml(adb)
-        vals = parse_position_xml(path)
-        if "latitude" in vals:
-            mq.publish(f"{cfg.topic_base}/latitude", str(vals["latitude"]), retain=True, qos=1)
-            mq.publish(f"{cfg.topic_base}/longitude", str(vals["longitude"]), retain=True, qos=1)
-            mq.publish(f"{cfg.topic_base}/location_json", json.dumps(vals), retain=True, qos=1)
-        
-        # Navigate back
-        adb.shell("input keyevent 4", timeout=2.0)
+
 
 def task_ac_page(cfg: Config, adb: ADB, mq: MQTT):
     with SEQUENCE_LOCK:
@@ -975,7 +923,7 @@ def main():
     # Publish discovery
     publish_discovery(cfg, mq, {
         "status": cfg.enable_vehicle_status,
-        "position": cfg.enable_vehicle_position,
+        "status": cfg.enable_vehicle_status,
         "ac": cfg.enable_ac_page
     })
 
@@ -1057,9 +1005,7 @@ def main():
                 try: task_vehicle_status(cfg, adb, mq)
                 except Exception as e: log_extra(logger, logging.ERROR, "Task Status failed", error=str(e))
 
-            if cfg.enable_vehicle_position:
-                try: task_vehicle_position(cfg, adb, mq)
-                except Exception as e: log_extra(logger, logging.ERROR, "Task Position failed", error=str(e))
+
 
             if cfg.enable_ac_page:
                 try: task_ac_page(cfg, adb, mq)

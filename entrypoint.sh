@@ -2,6 +2,17 @@
 set -euo pipefail
 
 PHONE_IP="${PHONE_IP:-}"
+PHONE_IP_FILE="${PHONE_IP_FILE:-}"
+
+if [ -z "$PHONE_IP" ] && [ -n "$PHONE_IP_FILE" ]; then
+    if [ -f "$PHONE_IP_FILE" ]; then
+        PHONE_IP=$(cat "$PHONE_IP_FILE" | tr -d '\r\n')
+        export PHONE_IP
+    else
+        echo "[entrypoint] WARNING: PHONE_IP_FILE set to '$PHONE_IP_FILE' but file does not exist."
+    fi
+fi
+
 ADB_PORT="${ADB_PORT:-5555}"
 
 echo "[entrypoint] PATH=$PATH"

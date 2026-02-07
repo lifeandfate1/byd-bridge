@@ -1,0 +1,47 @@
+version: '3.9'
+
+services:
+  byd-bridge:
+    image: ghcr.io/lifeandfate1/byd-bridge:latest
+    container_name: byd-bridge
+    restart: unless-stopped
+    
+    # "host" mode is recommended for simpler ADB/MQTT networking,
+    # but "bridge" works fine if PHONE_IP is reachable.=
+    # network_mode: host 
+    
+    environment:
+      # --- Connection (Required) ---
+      - PHONE_IP=192.168.1.x       # IP of your Android phone
+      - MQTT_BROKER=192.168.1.x    # IP of Home Assistant / MQTT Broker
+      
+      # --- Optional Connection ---
+      - MQTT_PORT=1883
+      - MQTT_USER=                 # Leave empty if no user
+      - MQTT_PASS=                 # Leave empty if no password
+      - ADB_PORT=5555
+      
+      # --- Features ---
+      - BYD_PIN=                   # Optional: Car PIN for remote unlock
+      - POLL_VEHICLE_STATUS=true   # Poll tire pressure, doors, etc.
+      - POLL_AC=true               # Poll A/C status
+      
+      # --- Polling Intervals (Seconds) ---
+      - POLL_SHUTDOWN_SECONDS=300  # Deep sleep (car off)
+      - POLL_CHARGING_SECONDS=60   # Charging
+      - POLL_RUNNING_SECONDS=120   # Driving
+      
+      # --- Advanced ---
+      - TZ=UTC                     # Timezone for logs (e.g., Europe/London)
+      - MQTT_TOPIC_BASE=byd/app
+      - BYD_DEVICE_NAME=BYD Vehicle
+      - HTTP_STATUS_PORT=8080      # Health check port
+    
+    # ports:
+    #   - "8080:8080"                # Optional: Health check port (conflict prone)
+
+    volumes:
+      - adb_keys:/root/.android    # Persist ADB keys (no need to re-approve)
+
+volumes:
+  adb_keys:

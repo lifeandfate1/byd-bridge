@@ -55,12 +55,25 @@ The Python script does not handle the connection; it assumes the environment has
 ### Phase 2: Deploy Container
 The container is configured to automatically connect to the phone IP on startup.
 
-1.  Place `byd_bridge.py` and `docker-compose.yml` in a folder.
-2.  Edit `docker-compose.yml` (see Configuration below) and set your `PHONE_IP`.
+**Option A: Docker Compose (Recommended)**
+1.  Copy the content of [`docker-compose.yml`](docker-compose.yml) or create a file with that name.
+2.  Edit the file to set your `PHONE_IP` and `MQTT_BROKER`.
 3.  Start the bridge:
     ```bash
     docker-compose up -d
     ```
+
+**Option B: Docker Run**
+Run the following command (replace variables as needed):
+```bash
+docker run -d --name byd-bridge --restart unless-stopped -e PHONE_IP=192.168.1.x -e MQTT_BROKER=192.168.1.x -e TZ=UTC -v adb_keys:/root/.android ghcr.io/lifeandfate1/byd-bridge:latest
+```
+
+> [!NOTE]
+> The container exposes port `8080` internally for health checks (`/healthz`). You can map this if needed with `-p 8080:8080`, but it is not required for normal operation.
+
+> [!TIP]
+> The `-v adb_keys:/root/.android` volume persists your ADB authentication keys. This means you won't have to tap "Allow USB Debugging" on your phone every time you update the container.
 
 ### Phase 3: Home Assistant
 Go to **Settings > Devices & Services > MQTT**. A new device **BYD App Bridge** will appear automatically.
@@ -102,6 +115,22 @@ Go to **Settings > Devices & Services > MQTT**. A new device **BYD App Bridge** 
 | `BYD_DEVICE_NAME` | `BYD Vehicle` | Friendly name in HA. |
 | `HTTP_STATUS_PORT` | `8080` | Port for health check/metrics. |
 | `DISCOVERY_PREFIX` | `homeassistant` | MQTT discovery prefix. |
+
+#### 🔐 Docker Secrets (Recommended for Passwords)
+You can supply sensitive variables via files (e.g., Docker Secrets) by appending `_FILE` to the variable name.
+*   `MQTT_BROKER_FILE`
+*   `PHONE_IP_FILE`
+*   `MQTT_USER_FILE`
+*   `MQTT_PASS_FILE`
+*   `BYD_PIN_FILE`
+
+Example:
+```yaml
+environment:
+  - MQTT_PASS_FILE=/run/secrets/mqtt_password
+secrets:
+  - mqtt_password
+```
 
 ## 🛠️ Troubleshooting
 

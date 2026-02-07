@@ -10,7 +10,7 @@ If the bridge is not detecting values correctly (or clicking the wrong coordinat
 2.  **App Version:** Which version of the BYD App is installed?
 3.  **UI Dump:**
     The script generates XML dumps of the screen structure. To help us debug, please run the following command while the container is running and attach the file to your issue:
-    '''bash
+    ```bash
     # Option A: Dump the current screen manually
     docker exec -it byd-bridge adb shell uiautomator dump /sdcard/debug_dump.xml
     docker exec -it byd-bridge adb pull /sdcard/debug_dump.xml /tmp/debug_dump.xml
@@ -19,7 +19,7 @@ If the bridge is not detecting values correctly (or clicking the wrong coordinat
     # Option B: Retrieve the last dump the script attempted to parse
     # (Useful if the bridge is crashing or failing to read a specific page)
     docker cp byd-bridge:/tmp/byd_last_dump.xml ./byd_last_dump.xml
-    '''
+    ```
     *Note: Please redact any personal info (VIN, License Plate) from the XML file before uploading.*
 
 ## 💡 Feature Requests

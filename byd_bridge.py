@@ -74,6 +74,7 @@ class Selectors:
     home_car_status: str = "com.byd.bydautolink:id/h_car_name_tv"
     home_last_update: str = "com.byd.bydautolink:id/tv_update_time"
     home_refresh_btn: str = "com.byd.bydautolink:id/btn_touch_refresh"
+    home_charging_tip: str = "com.byd.bydautolink:id/tv_charging_tip"
 
     # Home (tap targets)
     home_ac_row: str = "com.byd.bydautolink:id/c_air_item_rl_2"
@@ -94,7 +95,6 @@ class Selectors:
     temp_down: str = "com.byd.bydautolink:id/btn_temperature_reduce"
 
     # Nav Text (Used for Smart Recovery)
-    nav_vehicle_status_text: str = "Vehicle status"
     nav_vehicle_status_text: str = "Vehicle status"
     nav_ac_text: str = "A/C"
 
@@ -593,6 +593,15 @@ def parse_home_xml(path: str) -> Dict[str, Any]:
         out["car_status"] = _txt(n)
     if (n := _find_by_rid(root, SEL.home_last_update)) is not None:
         out["last_update"] = _txt(n)
+        
+    # Charging Status Override
+    if (n := _find_by_rid(root, SEL.home_charging_tip)) is not None:
+        text = _txt(n)
+        if text:
+            out["charging_text"] = text
+            # If we see the charging tip, we are definitely charging
+            out["car_status"] = "Charging"
+            
     return out
 
 def parse_status_xmls(top_path: str, bottom_path: str) -> Dict[str, Any]:
@@ -756,24 +765,22 @@ def ensure_home_state(cfg: Config, adb: ADB) -> bool:
 
         # 3. Check: Are we in a known Sub-Page? (The "Stuck" State)
         # Check for Vehicle Status Title
-        if _find_text_equals(root, SEL.nav_vehicle_status_text) or \
+        if _find_text_equals(root, SEL.nav_vehicle_status_text) is not None or \
            _find_all_text_contains(root, SEL.nav_vehicle_status_text):
             log_extra(logger, logging.WARNING, "Stuck on Status page. Pressing BACK.")
             adb.shell("input keyevent 4") # Back
             time.sleep(2.0)
             continue
             
-            continue
-
         # Check for A/C Page specific ID
-        if _find_by_rid(root, SEL.ac_heat_btn):
+        if _find_by_rid(root, SEL.ac_heat_btn) is not None:
             log_extra(logger, logging.WARNING, "Stuck on A/C page. Pressing BACK.")
             adb.shell("input keyevent 4") # Back
             time.sleep(2.0)
             continue
 
         # Check for My Account Page ("Account and Security" text)
-        if _find_text_equals(root, SEL.my_account_unique_text):
+        if _find_text_equals(root, SEL.my_account_unique_text) is not None:
             log_extra(logger, logging.WARNING, "Stuck on 'My Account' screen. Tapping 'My Car' tab.")
             
             # Find the "My car" tab text and tap it

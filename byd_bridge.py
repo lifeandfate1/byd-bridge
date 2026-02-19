@@ -98,6 +98,11 @@ class Selectors:
     nav_vehicle_status_text: str = "Vehicle status"
     nav_ac_text: str = "A/C"
 
+    # My Account Recovery
+    # "Account and Security" is a unique text on the My Account page
+    my_account_unique_text: str = "Account and Security" 
+    nav_my_car_text: str = "My car"
+
 SEL = Selectors()
 
 PIN_TAPS = {
@@ -758,11 +763,27 @@ def ensure_home_state(cfg: Config, adb: ADB) -> bool:
             time.sleep(2.0)
             continue
             
+            continue
+
         # Check for A/C Page specific ID
         if _find_by_rid(root, SEL.ac_heat_btn):
             log_extra(logger, logging.WARNING, "Stuck on A/C page. Pressing BACK.")
             adb.shell("input keyevent 4") # Back
             time.sleep(2.0)
+            continue
+
+        # Check for My Account Page ("Account and Security" text)
+        if _find_text_equals(root, SEL.my_account_unique_text):
+            log_extra(logger, logging.WARNING, "Stuck on 'My Account' screen. Tapping 'My Car' tab.")
+            
+            # Find the "My car" tab text and tap it
+            my_car_btn = _find_text_equals(root, SEL.nav_my_car_text)
+            if my_car_btn is not None:
+                _adb_tap_center_of(adb, my_car_btn)
+            else:
+                log_extra(logger, logging.ERROR, "Recovery failed: 'My car' button not found on screen")
+                
+            time.sleep(3.0)
             continue
 
         # 4. Check: Are we completely lost? (The "Crashed" State)
